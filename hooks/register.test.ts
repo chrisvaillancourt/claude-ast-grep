@@ -140,6 +140,13 @@ const err = (r: { result?: unknown; deny?: string }) => {
   if (r.deny === undefined) throw new Error(`not denied: ${String(r.result)}`)
   return JSON.parse(r.deny)
 }
+/** A promise and the function that settles it (Promise.withResolvers, which the typecheck's lib lacks). */
+function latch(): { promise: Promise<void>; resolve: () => void } {
+  let resolve: () => void = () => {}
+  const promise = new Promise<void>(r => { resolve = r })
+  return { promise, resolve }
+}
+
 const FOO = { pattern: 'foo($A)', rewrite: 'bar($A)', language: 'typescript' }
 const text = (seen: ReturnType<typeof world>, p: string) => seen.files.get(`${ROOT}/${p}`)?.text
 
@@ -563,5 +570,143 @@ describe('write authority', () => {
     expect(e.message).not.toContain('stays pending')
     expect(err(await call($, 'apply', { previewId: p.previewId })).code).toBe('UNKNOWN_PREVIEW')
     expect(seen.writes).toEqual([])
+  })
+})
+
+describe('event contract: no event carries a value read from the record before its update', () => {
+  const code = (r: { result?: unknown; deny?: string }) => (r.deny ? JSON.parse(r.deny).code : JSON.parse(r.result as string).status)
+
+  test('S1 /ast-grep discard whose liveness read is stale must be BUSY while a Write is in flight', async ($, on) => {
+    const { promise: gate, resolve: release } = latch()
+    const { promise: started, resolve: reached } = latch()
+    const seen = world(on, { write: async p => { if (p === '/w/src/a.ts') { reached(); await gate } return 'ok' as const } })
+    let count = -1
+    let id = ''
+    let applying: Promise<any> | undefined
+    // The apply runs inside the discard's first state read: the read inside its own update,
+    // whose write then misses the version, so the transition runs again on the applying record.
+    on('state.get', { plugin: 'ast-grep', key: 'session' }, async (_h, e, next) => {
+      const snap = await next(e)
+      if (count >= 0 && ++count === 1) { count = -1; applying = call($, 'apply', { previewId: id }); await started }
+      return snap
+    })
+    await start($)
+    id = ok(await call($, 'preview', { ...FOO, paths: ['src'] })).previewId
+    count = 0
+    const out = await $.command.run({ command: 'ast-grep', args: 'discard', ...COMMAND })
+    release()
+    if (!applying) throw new Error('not exercised')
+    const applied = await applying
+    expect({ cmd: out.text, apply: code(applied), writes: seen.writes.map(w => w.path) })
+      .toEqual({ cmd: expect.stringContaining("can't be discarded"), apply: 'applied', writes: ['/w/src/a.ts', '/w/src/d.ts'] })
+  })
+
+  test('S2 a second apply whose liveness read is stale must be BUSY, not INTERRUPTED', async ($, on) => {
+    const { promise: gate, resolve: release } = latch()
+    const { promise: started, resolve: reached } = latch()
+    world(on, { write: async p => { if (p === '/w/src/a.ts') { reached(); await gate } return 'ok' as const } })
+    let count = -1
+    let id = ''
+    let applying: Promise<any> | undefined
+    on('state.get', { plugin: 'ast-grep', key: 'session' }, async (_h, e, next) => {
+      const snap = await next(e)
+      if (count >= 0 && ++count === 2) { count = -1; applying = call($, 'apply', { previewId: id }); await started }
+      return snap
+    })
+    await start($)
+    id = ok(await call($, 'preview', { ...FOO, paths: ['src'] })).previewId
+    count = 0
+    const second = await call($, 'apply', { previewId: id })
+    release()
+    const first = await applying
+    expect({ second: code(second), first: code(first) }).toEqual({ second: 'BUSY', first: 'applied' })
+  })
+
+  test('S3 /ast-grep off whose liveness read is stale keeps the running apply on record, and status reports it', async ($, on) => {
+    const { promise: gate, resolve: release } = latch()
+    const { promise: started, resolve: reached } = latch()
+    const seen = world(on, { write: async p => { if (p === '/w/src/a.ts') { reached(); await gate } return 'ok' as const } })
+    let count = -1
+    let id = ''
+    let applying: Promise<any> | undefined
+    let during = ''
+    on('state.get', { plugin: 'ast-grep', key: 'session' }, async (_h, e, next) => {
+      const snap = await next(e)
+      if (count >= 0 && ++count === 1) { count = -1; applying = call($, 'apply', { previewId: id }); await started }
+      return snap
+    })
+    await start($)
+    id = ok(await call($, 'preview', { ...FOO, paths: ['src'] })).previewId
+    count = 0
+    await $.command.run({ command: 'ast-grep', args: 'off', ...COMMAND })
+    during = (await $.command.run({ command: 'ast-grep', args: 'status', ...COMMAND })).text ?? ''
+    release()
+    const applied = await applying
+    const after = (await $.command.run({ command: 'ast-grep', args: 'status', ...COMMAND })).text ?? ''
+    expect({ apply: code(applied), writes: seen.writes.map(w => w.path), duringHasPreview: during.includes(id), afterHasLast: after.includes('1 of 2') })
+      .toEqual({ apply: 'NOT_APPLIED', writes: ['/w/src/a.ts'], duringHasPreview: true, afterHasLast: true })
+  })
+
+  test('S4 an apply whose guard read is a stale snapshot from before off/on still applies the current preview', async ($, on) => {
+    const seen = world(on)
+    let stale: unknown = null
+    on('state.get', { plugin: 'ast-grep', key: 'session' }, async (_h, e, next) => {
+      const snap = await next(e)
+      if (stale) {
+        const v = stale
+        stale = null
+        return v as typeof snap
+      }
+      return snap
+    })
+    await start($)
+    ok(await call($, 'preview', { ...FOO, paths: ['src'] }))
+    await $.command.run({ command: 'ast-grep', args: 'off', ...COMMAND })
+    await $.command.run({ command: 'ast-grep', args: 'on', ...COMMAND })
+    const p2 = ok(await call($, 'preview', { ...FOO, paths: ['src'] }))
+    // the next state read (the apply's guard) answers with a snapshot from epoch 0
+    stale = { value: { mode: null, preview: null, last: null, epoch: 0 }, version: 1 }
+    const r = await call($, 'apply', { previewId: p2.previewId })
+    expect({ apply: code(r), writes: seen.writes.length }).toEqual({ apply: 'applied', writes: 2 })
+  })
+})
+
+describe('round-3 regression: discard during an in-flight Write', () => {
+  test('discard begun before apply claims the record must still refuse while its Write is in flight', async ($, on) => {
+    const { promise: writeGate, resolve: releaseWrite } = latch()
+    const { promise: writeStarted, resolve: reachedWrite } = latch()
+    const seen = world(on, {
+      write: async path => {
+        if (path === '/w/src/a.ts') {
+          reachedWrite?.()
+          await writeGate
+        }
+        return 'ok' as const
+      },
+    })
+    let armed = false
+    let id = ''
+    let applying: Promise<{ result?: unknown; deny?: string }> | undefined
+    on('state.get', { plugin: 'ast-grep', key: 'session' }, async (_hook, e, next) => {
+      const snapshot = await next(e)
+      if (armed) {
+        armed = false
+        applying = call($, 'apply', { previewId: id })
+        await writeStarted
+      }
+      return snapshot
+    })
+    await start($)
+    id = ok(await call($, 'preview', { ...FOO, paths: ['src'] })).previewId
+    armed = true
+    const discarded = await call($, 'discard', { previewId: id })
+    releaseWrite?.()
+    if (!applying) throw new Error('The state-read interleaving was not exercised')
+    const applied = await applying
+    expect({
+      discard: discarded.deny ? JSON.parse(discarded.deny).code : JSON.parse(discarded.result as string).status,
+      apply: applied.deny ? JSON.parse(applied.deny).code : JSON.parse(applied.result as string).status,
+      writes: seen.writes.map(w => w.path),
+    }).toEqual({ discard: 'BUSY', apply: 'applied', writes: ['/w/src/a.ts', '/w/src/d.ts'] })
   })
 })

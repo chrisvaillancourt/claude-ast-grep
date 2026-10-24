@@ -336,24 +336,33 @@ export const TOOLS = {
 // the tools are on. `/ast-grep off` bumps the epoch, so nothing begun before it
 // (a preview being built, an apply, a refused apply asking to stay pending) can
 // act again, and `on` never restores it.
+//
+// The event contract: an event carries only the caller's own identity (the
+// preview id, its run id, and for `publish` the epoch the operation began
+// under) and facts from outside the record (where, now, a Write outcome).
+// Anything about the record, liveness included, is derived here from the
+// record `transition` is handed, which `update` refreshes on every retry. A
+// value the caller read from the record before the update (an epoch, whether a
+// run is alive) may describe a different record, so no event carries one.
 
 export type Where = { sessionId: string; root: string }
 
 export type LifeEvent =
   | { type: 'publish'; preview: Preview; epoch: number; where: Where; now: number }
-  | { type: 'applyStart'; id: string; runId: string; epoch: number; where: Where; now: number; live: boolean }
+  | { type: 'applyStart'; id: string; runId: string; where: Where; now: number }
   | { type: 'writeAuthorized'; id: string; runId: string; index: number; where: Where }
   | { type: 'writeResult'; id: string; runId: string; index: number; status: FileStatus; note?: string }
   | { type: 'applyEnd'; id: string; runId: string; retain: boolean; summary: string }
-  | { type: 'off'; live: boolean }
+  | { type: 'off' }
   | { type: 'on' }
   | { type: 'clear' }
-  | { type: 'discard'; id: string | null; live: boolean }
+  | { type: 'discard'; id: string | null }
   | { type: 'expire'; now: number }
   | { type: 'reload' }
 
 export type LifeAction =
-  | { kind: 'published' | 'applying' | 'authorized' | 'recorded' | 'kept' | 'discarded' | 'interrupted' }
+  | { kind: 'published' | 'applying' | 'authorized' | 'recorded' | 'kept' | 'interrupted' }
+  | { kind: 'discarded'; preview: Preview }
   | { kind: 'dropped'; preview: Preview; why: string }
   | { kind: 'denied'; code: ErrorCode; message: string }
 
@@ -384,7 +393,13 @@ function ownRun(s: Session, id: string, runId: string): Preview | null {
   return p && p.id === id && p.runId === runId && p.state === 'applying' ? p : null
 }
 
-export function transition(s: Session, e: LifeEvent, config: Config): Step {
+/**
+ * `isLive(runId)`: whether that apply run is alive in this copy of the module
+ * (register.ts answers from `liveRuns`). It is asked only about the run id the
+ * record holds, so busy versus interrupted is judged on every retry.
+ */
+export function transition(s: Session, e: LifeEvent, config: Config, isLive: (runId: string) => boolean): Step {
+  const running = (p: Preview | null) => p !== null && p.state === 'applying' && p.runId !== null && isLive(p.runId)
   switch (e.type) {
     case 'publish': {
       if (e.epoch !== s.epoch) return deny(s, 'REVOKED', 'ast-grep was turned off after this preview started')
@@ -403,9 +418,10 @@ export function transition(s: Session, e: LifeEvent, config: Config): Step {
       if (!p || p.id !== e.id) {
         return deny(s, 'UNKNOWN_PREVIEW', p ? `No preview ${e.id}; the pending one is ${p.id}.` : `No preview ${e.id} is pending: it was applied, discarded, dropped or never made. Preview again.`)
       }
-      if (p.state === 'applying' && e.live) return deny(s, 'BUSY', `Preview ${p.id} is being applied right now.`)
+      if (running(p)) return deny(s, 'BUSY', `Preview ${p.id} is being applied right now.`)
       if (p.state !== 'pending') return deny(s, 'INTERRUPTED', `An apply of preview ${p.id} was interrupted (a reload or a failure inside the plugin); it is never resumed. Check the files, then /ast-grep discard.`)
-      if (e.epoch !== s.epoch || p.epoch !== s.epoch) {
+      // The preview's own epoch is the authority; the caller passes none.
+      if (p.epoch !== s.epoch) {
         const d = drop(s, 'revoked by /ast-grep off')
         return deny(d.record, 'REVOKED', `Preview ${p.id} was revoked by /ast-grep off and dropped. Preview again.`, d.actions)
       }
@@ -455,7 +471,7 @@ export function transition(s: Session, e: LifeEvent, config: Config): Step {
       const next = { ...s, mode: 'off' as const, epoch: s.epoch + 1 }
       const p = s.preview
       // A running apply keeps its record so it can report; it has lost authority (epoch) and ends dropped.
-      if (p && p.state === 'applying' && e.live) return { record: next, actions: [] }
+      if (running(p)) return { record: next, actions: [] }
       return drop(next, 'turned off')
     }
     case 'on':
@@ -465,8 +481,8 @@ export function transition(s: Session, e: LifeEvent, config: Config): Step {
     case 'discard': {
       const p = s.preview
       if (!p || (e.id !== null && p.id !== e.id)) return deny(s, 'UNKNOWN_PREVIEW', `No preview ${e.id ?? ''} is pending.`.replace('  ', ' '))
-      if (p.state === 'applying' && e.live) return deny(s, 'BUSY', `Preview ${p.id} is being applied right now.`)
-      return { record: { ...s, preview: null }, actions: [{ kind: 'discarded' }] }
+      if (running(p)) return deny(s, 'BUSY', `Preview ${p.id} is being applied right now.`)
+      return { record: { ...s, preview: null }, actions: [{ kind: 'discarded', preview: p }] }
     }
     case 'expire': {
       const p = s.preview

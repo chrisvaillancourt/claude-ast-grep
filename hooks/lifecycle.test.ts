@@ -25,22 +25,26 @@ const STATES: Record<string, Session> = {
 
 const EVENTS: Record<string, LifeEvent> = {
   publish: { type: 'publish', preview: preview({ id: 'p2', epoch: 1 }), epoch: 1, where: W, now: 0 },
-  applyStart: { type: 'applyStart', id: 'p1', runId: 'r1', epoch: 1, where: W, now: 0, live: true },
+  applyStart: { type: 'applyStart', id: 'p1', runId: 'r2', where: W, now: 0 },
   writeAuthorized: { type: 'writeAuthorized', id: 'p1', runId: 'r1', index: 0, where: W },
   writeResult: { type: 'writeResult', id: 'p1', runId: 'r1', index: 0, status: 'written' },
   applyEndRetain: { type: 'applyEnd', id: 'p1', runId: 'r1', retain: true, summary: 's' },
   applyEndDrop: { type: 'applyEnd', id: 'p1', runId: 'r1', retain: false, summary: 's' },
-  off: { type: 'off', live: true },
+  off: { type: 'off' },
   on: { type: 'on' },
   clear: { type: 'clear' },
-  discard: { type: 'discard', id: 'p1', live: true },
+  discard: { type: 'discard', id: 'p1' },
   expire: { type: 'expire', now: 0 },
   reload: { type: 'reload' },
 }
 
 /** What a transition did, in one word each: the preview after it (`id:state`), and the action or denial. */
-function outcome(s: Session, e: LifeEvent): string {
-  const { record, actions } = transition(s, e, CONFIG)
+/** Liveness as `liveRuns` would answer it: run r1 (the `applying` state's) is alive; r0 (`interrupted`) is not. */
+const LIVE = (runId: string) => runId === 'r1'
+const DEAD = () => false
+
+function outcome(s: Session, e: LifeEvent, isLive: (runId: string) => boolean = LIVE): string {
+  const { record, actions } = transition(s, e, CONFIG, isLive)
   const p = record.preview ? `${record.preview.id}:${record.preview.state}` : 'none'
   const a = actions.map(x => (x.kind === 'denied' ? x.code : x.kind)).join('+') || '-'
   return `${p} ${a}`
@@ -92,23 +96,25 @@ describe('transition: every state × event', () => {
 
 describe('transition: epochs and authority', () => {
   test('off bumps the epoch; on keeps it; clear starts a new epoch with no preview', async () => {
-    expect(transition(STATES.pending!, EVENTS.off!, CONFIG).record).toMatchObject({ mode: 'off', epoch: 2, preview: null })
-    expect(transition({ ...STATES.none!, mode: 'off', epoch: 2 }, EVENTS.on!, CONFIG).record).toMatchObject({ mode: 'on', epoch: 2 })
-    expect(transition(STATES.applying!, EVENTS.clear!, CONFIG).record).toMatchObject({ epoch: 2, preview: null })
+    expect(transition(STATES.pending!, EVENTS.off!, CONFIG, LIVE).record).toMatchObject({ mode: 'off', epoch: 2, preview: null })
+    expect(transition({ ...STATES.none!, mode: 'off', epoch: 2 }, EVENTS.on!, CONFIG, LIVE).record).toMatchObject({ mode: 'on', epoch: 2 })
+    expect(transition(STATES.applying!, EVENTS.clear!, CONFIG, LIVE).record).toMatchObject({ epoch: 2, preview: null })
   })
 
   test('off while an apply runs, then on: the run is never authorized again and its refusal does not restore the preview', async () => {
-    let s = transition(STATES.applying!, EVENTS.off!, CONFIG).record
-    s = transition(s, EVENTS.on!, CONFIG).record
+    let s = transition(STATES.applying!, EVENTS.off!, CONFIG, LIVE).record
+    s = transition(s, EVENTS.on!, CONFIG, LIVE).record
     expect(outcome(s, EVENTS.writeAuthorized!)).toBe('p1:applying REVOKED')
     expect(outcome(s, EVENTS.applyEndRetain!)).toBe('none dropped')
-    const after = transition(s, EVENTS.applyEndRetain!, CONFIG).record
-    expect(outcome(after, { ...(EVENTS.applyStart as Extract<LifeEvent, { type: 'applyStart' }>), epoch: 2 })).toBe('none UNKNOWN_PREVIEW')
+    const after = transition(s, EVENTS.applyEndRetain!, CONFIG, LIVE).record
+    expect(outcome(after, EVENTS.applyStart!)).toBe('none UNKNOWN_PREVIEW')
   })
 
-  test('an operation that started in an older epoch cannot publish or start an apply', async () => {
+  test('a publish begun in an older epoch is refused; applyStart takes no caller epoch, the preview\'s own decides', async () => {
     expect(outcome(STATES.none!, { ...(EVENTS.publish as Extract<LifeEvent, { type: 'publish' }>), epoch: 0 })).toBe('none REVOKED')
-    expect(outcome(STATES.pending!, { ...(EVENTS.applyStart as Extract<LifeEvent, { type: 'applyStart' }>), epoch: 0 })).toBe('none dropped+REVOKED')
+    // a caller that read a stale epoch can't revoke a current preview: applyStart carries none
+    expect(outcome(STATES.pending!, EVENTS.applyStart!)).toBe('p1:applying applying')
+    expect(outcome(STATES.revoked!, EVENTS.applyStart!)).toBe('none dropped+REVOKED')
   })
 
   test('off as the session state refuses publish and writes', async () => {
@@ -123,18 +129,32 @@ describe('transition: epochs and authority', () => {
     expect(outcome(STATES.pending!, { ...(EVENTS.applyStart as Extract<LifeEvent, { type: 'applyStart' }>), where: { sessionId: 's1', root: '/x' } })).toBe('none dropped+SESSION_CHANGED')
   })
 
-  test('an apply interrupted by a dead run reads as interrupted, not busy', async () => {
-    expect(outcome(STATES.applying!, { ...(EVENTS.applyStart as Extract<LifeEvent, { type: 'applyStart' }>), live: false })).toBe('p1:applying INTERRUPTED')
-    expect(outcome(STATES.applying!, { type: 'discard', id: 'p1', live: false })).toBe('none discarded')
-    expect(outcome(STATES.applying!, { type: 'off', live: false })).toBe('none dropped')
+  test('liveness is judged inside the transition from the record\'s own run id', async () => {
+    // applying, its run alive: busy for applyStart and discard, off keeps the record
+    expect(outcome(STATES.applying!, EVENTS.applyStart!, LIVE)).toBe('p1:applying BUSY')
+    expect(outcome(STATES.applying!, EVENTS.discard!, LIVE)).toBe('p1:applying BUSY')
+    expect(outcome(STATES.applying!, EVENTS.off!, LIVE)).toBe('p1:applying -')
+    // applying, its run dead (this copy of the module never started it): interrupted, discard allowed, off drops it
+    expect(outcome(STATES.applying!, EVENTS.applyStart!, DEAD)).toBe('p1:applying INTERRUPTED')
+    expect(outcome(STATES.applying!, EVENTS.discard!, DEAD)).toBe('none discarded')
+    expect(outcome(STATES.applying!, EVENTS.off!, DEAD)).toBe('none dropped')
+    // the predicate is asked about the record's run id, not anything the caller passed
+    const asked: string[] = []
+    transition(STATES.applying!, EVENTS.discard!, CONFIG, r => (asked.push(r), true))
+    expect(asked).toEqual(['r1'])
+  })
+
+  test('the discard action carries the preview it removed, so reports come from the record the update decided on', async () => {
+    const { actions } = transition(STATES.interrupted!, EVENTS.discard!, CONFIG, DEAD)
+    expect(actions).toEqual([{ kind: 'discarded', preview: STATES.interrupted!.preview }])
   })
 
   test('writeAuthorized marks the file writing; writeResult records the outcome', async () => {
-    const a = transition(STATES.applying!, EVENTS.writeAuthorized!, CONFIG).record
+    const a = transition(STATES.applying!, EVENTS.writeAuthorized!, CONFIG, LIVE).record
     expect(a.preview!.files[0]!.status).toBe('writing')
-    const b = transition(a, { type: 'writeResult', id: 'p1', runId: 'r1', index: 0, status: 'refused', note: 'no' }, CONFIG).record
+    const b = transition(a, { type: 'writeResult', id: 'p1', runId: 'r1', index: 0, status: 'refused', note: 'no' }, CONFIG, LIVE).record
     expect(b.preview!.files[0]).toMatchObject({ status: 'refused', note: 'no' })
-    const kept = transition(b, EVENTS.applyEndRetain!, CONFIG).record
+    const kept = transition(b, EVENTS.applyEndRetain!, CONFIG, LIVE).record
     expect(kept.preview).toMatchObject({ state: 'pending', runId: null })
     expect(kept.preview!.files[0]!.status).toBe('unstarted')
   })

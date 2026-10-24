@@ -169,7 +169,8 @@ async function guard($: EngineInterface, e: { agentId?: string }): Promise<Sessi
 async function step($: EngineInterface, ev: LifeEvent): Promise<Step> {
   let out: Step = { record: INITIAL, actions: [] }
   await update($, sessionAtom, s => {
-    out = transition(s, ev, config)
+    // Liveness is asked inside the update, of the record's own run id, on every retry.
+    out = transition(s, ev, config, runId => liveRuns.has(runId))
     return out.record
   })
   return out
@@ -178,11 +179,6 @@ async function step($: EngineInterface, ev: LifeEvent): Promise<Step> {
 function denialOf(st: Step): { code: ErrorCode; message: string } | null {
   for (const a of st.actions) if (a.kind === 'denied') return { code: a.code, message: a.message }
   return null
-}
-
-/** Whether the run that holds the session's applying preview is alive in this copy of the module. */
-function isLive(s: Session): boolean {
-  return s.preview?.state === 'applying' && s.preview.runId !== null && liveRuns.has(s.preview.runId)
 }
 
 function fileReport(files: readonly PreviewFile[]) {
@@ -312,23 +308,30 @@ function outcome(kind: WriteOutcome, hash: string | null, f: PreviewFile, extra:
 }
 
 async function apply($: EngineInterface, e: Record<string, unknown> & { agentId?: string }): Promise<string> {
-  const { epoch } = await guard($, e)
+  await guard($, e)
   const q = validatePreviewId(e)
   if (!q.ok) throw new Refusal('INVALID_INPUT', q.error)
   const id = q.value
   const where = await whereNow($)
   // Claim it: pending -> applying, under a run id only this copy of the module knows.
+  // The run is live from before its claim, so no transition ever sees it applying and not live.
   const runId = newId('run')
-  const started = await step($, {
-    type: 'applyStart', id, runId, epoch, where, now: await $.clock.now(), live: isLive(await read($, sessionAtom)),
-  })
+  liveRuns.add(runId)
+  let started: Step
+  try {
+    started = await step($, { type: 'applyStart', id, runId, where, now: await $.clock.now() })
+  } catch (err) {
+    liveRuns.delete(runId)
+    throw err
+  }
   const refused = denialOf(started)
   if (refused) {
-    const held = (await read($, sessionAtom)).preview
+    liveRuns.delete(runId)
+    // Reported from the record the transition decided on, not from a separate read.
+    const held = started.record.preview
     throw new Refusal(refused.code, refused.message, refused.code === 'INTERRUPTED' && held ? { files: fileReport(held.files) } : {})
   }
   const p = started.record.preview!
-  liveRuns.add(runId)
   try {
     // 1. Every target unchanged, before any write.
     const changed: string[] = []
@@ -424,7 +427,7 @@ async function discard($: EngineInterface, e: Record<string, unknown> & { agentI
   if (e.agentId !== undefined) throw new Refusal('SUBAGENT', 'The ast-grep tools serve the main conversation only.')
   const q = validatePreviewId(e)
   if (!q.ok) throw new Refusal('INVALID_INPUT', q.error)
-  const done = await step($, { type: 'discard', id: q.value, live: isLive(await read($, sessionAtom)) })
+  const done = await step($, { type: 'discard', id: q.value })
   const refused = denialOf(done)
   if (refused) throw new Refusal(refused.code, refused.message)
   return JSON.stringify({ status: 'discarded', previewId: q.value })
@@ -477,14 +480,15 @@ export const register: Register = (on, options) => {
     const cmd = parseArgs(e.args)
     if (cmd.kind === 'help') return { text: cmd.error ? `${cmd.error}\n${USAGE}` : USAGE }
     if (cmd.kind === 'set') {
-      const live = isLive(await read($, sessionAtom))
-      await step($, cmd.mode === 'off' ? { type: 'off', live } : { type: 'on' })
+      await step($, cmd.mode === 'off' ? { type: 'off' } : { type: 'on' })
     }
     if (cmd.kind === 'discard') {
-      const held = (await read($, sessionAtom)).preview
-      const done = await step($, { type: 'discard', id: null, live: isLive(await read($, sessionAtom)) })
+      const done = await step($, { type: 'discard', id: null })
       const refused = denialOf(done)
       if (refused?.code === 'BUSY') return { text: `${refused.message} It can't be discarded.` }
+      // Reported from the preview the transition removed, not from a separate read.
+      const gone = done.actions.find(a => a.kind === 'discarded')
+      const held = gone?.kind === 'discarded' ? gone.preview : null
       if (refused || !held) return { text: 'No preview to discard.' }
       const lines = held.files.map(f => `  ${f.path}: ${f.status}${f.note ? ` (${f.note})` : ''}`)
       const broken = held.state !== 'pending'
