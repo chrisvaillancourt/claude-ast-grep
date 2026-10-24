@@ -484,4 +484,21 @@ describe('write authority', () => {
     const status = await $.command.run({ command: 'ast-grep', args: 'status', ...COMMAND })
     expect(status.text).toContain('No pending preview')
   })
+
+  test('a second apply or a discard while one runs is BUSY and changes nothing', async ($, on) => {
+    let inner: { apply?: any; discard?: any } = {}
+    let id = ''
+    world(on, {
+      afterWrite: async (_, path) => {
+        if (path !== '/w/src/a.ts' || inner.apply) return
+        inner.apply = err(await call($, 'apply', { previewId: id }))
+        inner.discard = err(await call($, 'discard', { previewId: id }))
+      },
+    })
+    await start($)
+    id = ok(await call($, 'preview', { ...FOO, paths: ['src'] })).previewId
+    expect(ok(await call($, 'apply', { previewId: id })).status).toBe('applied')
+    expect(inner.apply.code).toBe('BUSY')
+    expect(inner.discard.code).toBe('BUSY')
+  })
 })

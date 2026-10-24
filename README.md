@@ -106,7 +106,7 @@ ast-grep 0.51.0 or newer on `PATH` (`brew install ast-grep`, `cargo install ast-
 - A reload during an apply leaves an `interrupted` record listing what was known about each file; the mod never resumes it. `/ast-grep discard` clears it.
 - Tools are refused in subagents.
 - On Claude Code 2.1.310 the built-in Edit accepted a file the mod had just written without a fresh Read (the Write call refreshes the engine's record of the file), even though the conversation never saw the new content. The apply result tells the model to Read first anyway.
-- Checked live on Claude Code 2.1.310 in headless sessions only (search, preview, apply on CRLF, non-ASCII and no-final-newline files; a stale target; a refused write). The interactive permission prompt for apply, an edited proposal (`userModified`) and a reload during an apply have not been checked live yet; the test kit covers them.
+- Checked live on Claude Code 2.1.310 in headless sessions only (search, preview, apply on CRLF, non-ASCII and no-final-newline files; a stale target; a refused write). The interactive permission prompt for apply and an edited proposal (`userModified`) have not been checked live; the test kit covers them with a mocked Write tool, as it covers a second apply or a discard during an apply (`BUSY`), `/clear` or a directory change right before a write, and `/ast-grep off` during a preview or an apply. A reload during an apply (the `interrupted` record) is neither tested nor checked live.
 
 ## Install
 
