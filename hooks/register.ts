@@ -37,7 +37,7 @@ const DISCARD = 'mcp__ast-grep__discard'
 
 // Change the shape tag when Session's fields change: a value an older version
 // stored (it outlives a hot reload) then reads as INITIAL instead of breaking.
-const sessionAtom = atom({ plugin: 'ast-grep', key: 'session' } as const, INITIAL, { shape: 'session-2' })
+const sessionAtom = atom({ plugin: 'ast-grep', key: 'session' } as const, INITIAL, { shape: 'session-3' })
 
 // Module variables reset on a hot reload; register and session.start run again then.
 let config: Config = configFrom({})
@@ -268,7 +268,7 @@ async function preview($: EngineInterface, e: Record<string, unknown> & { agentI
     id: newId('ag'), sessionId: where.sessionId, root: where.root, createdAt: at, expiresAt: at + PREVIEW_TTL_MS,
     pattern: q.value.pattern, rewrite: q.value.rewrite, language: q.value.language, replacements, files, state: 'pending', runId: null,
   }
-  const denied = await authorize($, where, { kind: 'publish', preview: p })
+  const denied = await authorize($, { ...where, epoch: s.epoch }, { kind: 'publish', preview: p })
   if (denied) throw new Refusal(denied.code, denied.code === 'PREVIEW_PENDING' ? denied.message : `No preview was kept: ${denied.message}.`)
   log($, `preview ${p.id}: ${replacements} replacements in ${files.length} files`)
   const out = JSON.parse(previewText(p, diff)) as Record<string, unknown>
@@ -277,7 +277,7 @@ async function preview($: EngineInterface, e: Record<string, unknown> & { agentI
 }
 
 /** The facts an operation started from; it may act only while they still hold. */
-type Op = { sessionId: string; root: string }
+type Op = { sessionId: string; root: string; epoch: number }
 
 /** What an operation asks to do: publish its preview, or issue the Write of file `index` of a run. */
 type Act = { kind: 'publish'; preview: Preview } | { kind: 'write'; id: string; runId: string; index: number }
@@ -285,7 +285,9 @@ type Act = { kind: 'publish'; preview: Preview } | { kind: 'write'; id: string; 
 type Denial = { code: ErrorCode; message: string }
 
 /** Whether `act` may happen in state `s`, or why not. Pure: the one rule for write authority. */
-function decide(s: Session, act: Act, now: number): Denial | null {
+function decide(s: Session, op: Op, act: Act, now: number): Denial | null {
+  if (s.epoch !== op.epoch) return { code: 'REVOKED', message: 'ast-grep was turned off after this operation started' }
+  if (!isActive(config, s)) return { code: 'OFF', message: 'ast-grep is off for this session' }
   if (act.kind === 'publish') {
     const held = s.preview
     if (held && (held.state === 'applying' || now < held.expiresAt)) {
@@ -319,7 +321,7 @@ async function authorize($: EngineInterface, op: Op, act: Act): Promise<Denial |
   const at = await $.clock.now()
   let denial: Denial | null = null
   await update($, sessionAtom, s => {
-    denial = decide(s, act, at)
+    denial = decide(s, op, act, at)
     return denial ? s : transition(s, act)
   })
   return denial
@@ -348,7 +350,7 @@ function outcome(kind: WriteOutcome, hash: string | null, f: PreviewFile, extra:
 }
 
 async function apply($: EngineInterface, e: Record<string, unknown> & { agentId?: string }): Promise<string> {
-  await guard($, e)
+  const { epoch } = await guard($, e)
   const q = validatePreviewId(e)
   if (!q.ok) throw new Refusal('INVALID_INPUT', q.error)
   const id = q.value
@@ -359,7 +361,7 @@ async function apply($: EngineInterface, e: Record<string, unknown> & { agentId?
   const runId = newId('run')
   let claimed = false
   await update($, sessionAtom, s => {
-    claimed = s.preview?.id === id && s.preview.state === 'pending'
+    claimed = s.preview?.id === id && s.preview.state === 'pending' && s.epoch === epoch
     return claimed ? { ...s, preview: { ...s.preview!, state: 'applying' as const, runId } } : s
   })
   if (!claimed) throw new Refusal('BUSY', `Preview ${id} is no longer pending.`)
@@ -396,7 +398,7 @@ async function apply($: EngineInterface, e: Record<string, unknown> & { agentId?
         break
       }
       // The last step before the Write: nothing is awaited between it and the call.
-      const denied = await authorize($, { sessionId: p.sessionId, root: p.root }, { kind: 'write', id, runId, index: i })
+      const denied = await authorize($, { sessionId: p.sessionId, root: p.root, epoch }, { kind: 'write', id, runId, index: i })
       if (denied) {
         f.status = 'not-written'
         f.note = denied.message
@@ -513,7 +515,8 @@ export const register: Register = (on, options) => {
     if (cmd.kind === 'set') {
       await update($, sessionAtom, s => {
         const live = s.preview?.state === 'applying' && s.preview.runId !== null && liveRuns.has(s.preview.runId)
-        return { ...s, mode: cmd.mode, preview: cmd.mode === 'off' && !live ? null : s.preview }
+        // Off bumps the epoch: every running operation loses its authority, and on never restores it.
+        return { ...s, mode: cmd.mode, epoch: cmd.mode === 'off' ? s.epoch + 1 : s.epoch, preview: cmd.mode === 'off' && !live ? null : s.preview }
       })
     }
     if (cmd.kind === 'discard') {

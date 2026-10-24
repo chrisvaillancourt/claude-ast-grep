@@ -21,7 +21,7 @@ export const MAX_SNAPSHOT_BYTES = 1024 * KIB
 export const MAX_DIFF_BYTES = 64 * KIB
 export const PREVIEW_TTL_MS = 15 * 60_000
 
-export const INITIAL: Session = { mode: null, preview: null, last: null }
+export const INITIAL: Session = { mode: null, preview: null, last: null, epoch: 0 }
 
 export function configFrom(options: Record<string, unknown>): Config {
   const secs = typeof options.timeoutSeconds === 'number' && Number.isFinite(options.timeoutSeconds) ? options.timeoutSeconds : 30
@@ -71,7 +71,7 @@ export type ErrorCode =
   | 'OFF' | 'SUBAGENT' | 'INVALID_INPUT' | 'INVALID_RULE' | 'UNSUPPORTED_LANGUAGE' | 'CLI_ERROR' | 'CLI_OUTPUT'
   | 'CLI_MISSING' | 'CLI_VERSION' | 'PATH' | 'UNSUPPORTED_FILE' | 'OVERLAP' | 'BAD_OFFSET' | 'SNAPSHOT_MISMATCH'
   | 'TOO_LARGE' | 'NO_CHANGES' | 'PREVIEW_PENDING' | 'UNKNOWN_PREVIEW' | 'EXPIRED' | 'BUSY' | 'STALE'
-  | 'WRITE_DENIED' | 'NOT_APPLIED' | 'SESSION_CHANGED' | 'INTERRUPTED' | 'INTERNAL'
+  | 'WRITE_DENIED' | 'NOT_APPLIED' | 'REVOKED' | 'SESSION_CHANGED' | 'INTERRUPTED' | 'INTERNAL'
 
 /** A refusal's text: JSON the model reads as the tool's error. */
 export function errorText(code: ErrorCode, message: string, extra: Record<string, unknown> = {}): string {

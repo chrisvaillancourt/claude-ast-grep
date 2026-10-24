@@ -431,4 +431,38 @@ describe('write authority', () => {
     expect(e.files.map((f: any) => f.status)).toEqual(['not-written', 'unstarted'])
     expect(seen.writes).toEqual([])
   })
+
+  test('/ast-grep off after the first write: the next file is not written and the result is not "applied"', async ($, on) => {
+    let turnedOff = false
+    const seen = world(on, {
+      afterWrite: async (_, path) => {
+        if (path === '/w/src/a.ts' && !turnedOff) {
+          turnedOff = true
+          await $.command.run({ command: 'ast-grep', args: 'off', ...COMMAND })
+        }
+      },
+    })
+    await start($)
+    const p = ok(await call($, 'preview', { ...FOO, paths: ['src'] }))
+    const e = err(await call($, 'apply', { previewId: p.previewId }))
+    expect(e.files.map((f: any) => f.status)).toEqual(['written', 'not-written'])
+    expect(text(seen, 'src/d.ts')).toBe('foo(4)\n')
+  })
+
+  test('off then on during the preview\'s scan: no preview is published', async ($, on) => {
+    let toggled = false
+    world(on, {
+      onStdinScan: async () => {
+        if (toggled) return
+        toggled = true
+        await $.command.run({ command: 'ast-grep', args: 'off', ...COMMAND })
+        await $.command.run({ command: 'ast-grep', args: 'on', ...COMMAND })
+      },
+    })
+    await start($)
+    const r = await call($, 'preview', { ...FOO, paths: ['src'] })
+    expect(r.deny === undefined ? 'published' : JSON.parse(r.deny).code).toBe('REVOKED')
+    const status = await $.command.run({ command: 'ast-grep', args: 'status', ...COMMAND })
+    expect(status.text).toContain('No pending preview')
+  })
 })

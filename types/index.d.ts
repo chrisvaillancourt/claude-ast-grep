@@ -64,6 +64,12 @@ export type Session = {
   preview: Preview | null
   /** One line on the last apply's outcome, for /ast-grep status. */
   last: string | null
+  /**
+   * Bumped by every /ast-grep off. An operation captures it when it starts and
+   * may publish or write only while it is unchanged, so off revokes work already
+   * running and a later on never restores it.
+   */
+  epoch: number
 }
 
 /** One recorded ast-grep run (hooks/corpus.ts, written by scripts/capture-corpus.sh). */

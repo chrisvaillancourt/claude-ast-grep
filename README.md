@@ -63,7 +63,7 @@ Out of contract:
 `/ast-grep [status|on|off|discard]`
 
 - `status` (the default): on or off and why, the ast-grep version found, the pending preview (id, files, time left) and the last apply's outcome.
-- `on` / `off`: turn the tools on or off for this session. Off, every call is refused with a message saying so and a pending preview is dropped. The tools stay registered either way, so the tool list doesn't change mid-session.
+- `on` / `off`: turn the tools on or off for this session. Off, every call is refused with a message saying so and a pending preview is dropped. A preview or apply already running when you turn it off stops at its next step: the preview is not kept, and the apply issues no further Write (a Write already issued is not undone). Turning it on again does not resume either. The tools stay registered either way, so the tool list doesn't change mid-session.
 - `discard`: drop the pending preview, or clear the record of an apply a reload interrupted.
 
 ## Options
