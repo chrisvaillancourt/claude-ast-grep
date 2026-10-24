@@ -35,7 +35,7 @@ type Hooks = {
 
 function world(on: On, opts: { files?: Record<string, File>; write?: (path: string) => WriteMode | Promise<WriteMode>; check?: (path: string) => 'allow' | 'deny' | Promise<'allow' | 'deny'>; noBinary?: boolean } & Hooks = {}) {
   const files = new Map<string, File>(Object.entries({ ...PROJECT, ...opts.files }).map(([k, v]) => [`${ROOT}/${k}`, v]))
-  const dirs = new Set([ROOT, `${ROOT}/src`, `${ROOT}/src/.cache`, '/w2'])
+  const dirs = new Set([ROOT, `${ROOT}/src`, `${ROOT}/src/.cache`, `${ROOT}/hiddenScope`, `${ROOT}/visibleScope`, `${ROOT}/visibleScope/sub`, '/w2'])
   const reads = new Map<string, number>()
   const seen = {
     tools: [] as { name: string; isDeferred?: boolean }[],
@@ -86,12 +86,22 @@ function world(on: On, opts: { files?: Record<string, File>; write?: (path: stri
     const rule = JSON.parse(argv[argv.indexOf('--inline-rules') + 1]!) as { language: string; rule: { pattern: string }; fix?: string }
     const stdin = argv.includes('--stdin') ? e.init?.stdin : undefined
     const paths = argv.includes('--') ? argv.slice(argv.indexOf('--') + 1) : []
+    const globs = argv.flatMap((a, i) => (a === '--globs' ? [argv[i + 1]!] : []))
+    const max = Number(argv[argv.indexOf('--max-results') + 1])
     if (stdin !== undefined) await opts.onStdinScan?.($)
     // A recorded stdin run over the same text answers a stdin run over any file.
     const c = CORPUS.find(x =>
       x.language === rule.language && x.pattern === rule.rule.pattern && x.fix === rule.fix &&
-      (stdin === undefined ? x.stdin === undefined && JSON.stringify(x.paths) === JSON.stringify(paths) : x.stdin === stdin))
+      (stdin === undefined
+        ? x.stdin === undefined && JSON.stringify(x.paths) === JSON.stringify(paths) && JSON.stringify(x.globs ?? []) === JSON.stringify(globs) && x.maxResults === max
+        : x.stdin === stdin))
     if (c) return { value: c.result }
+    // ast-grep's order across files is unspecified: for the two scopes scanned
+    // without the mod's hidden glob, answer with the recorded hidden-only run, as
+    // the round-2 review saw live (the hidden file used up the cap).
+    if (stdin === undefined && JSON.stringify(paths) === '["hiddenScope","visibleScope"]' && !globs.includes('!.*')) {
+      return { value: CORPUS.find(x => x.name === 'raw-hidden-only')!.result }
+    }
     const nested = CORPUS.find(x => x.name === 'nested')!
     if (stdin === undefined && paths[0] === 'n.ts') return { value: { ...nested.result, stdout: nested.result.stdout.replaceAll('"STDIN"', '"n.ts"') } }
     throw new Error(`no corpus case for ${JSON.stringify({ rule, paths, stdin })}`)
@@ -189,7 +199,22 @@ describe('search', () => {
       'src/d.ts:1:1 foo(4) A=4',
     ])
     expect(out.truncated).toBe(false)
-    expect(out.skippedHidden).toEqual(['.hidden.ts'])
+    expect(out.skippedHidden).toBeUndefined()
+  })
+
+  test('hidden matches never use up the result cap (200 hidden, 4 visible), with or without globs', async ($, on) => {
+    world(on, {
+      files: {
+        'hiddenScope/.hidden.ts': { text: Array.from({ length: 200 }, (_, i) => `foo(${i + 1})\n`).join('') },
+        'visibleScope/a.ts': { text: 'foo(1)\nfoo(2)\n' },
+        'visibleScope/sub/b.ts': { text: 'foo(3)\nfoo(4)\n' },
+      },
+    })
+    await start($)
+    for (const globs of [undefined, ['*.ts']]) {
+      const out = ok(await call($, 'search', { pattern: 'foo($A)', language: 'typescript', paths: ['hiddenScope', 'visibleScope'], maxResults: 1, ...(globs ? { globs } : {}) }))
+      expect(out).toMatchObject({ count: 1, truncated: true, matches: [{ file: 'visibleScope/a.ts' }] })
+    }
   })
 
   test('a hidden path named explicitly is searched', async ($, on) => {
@@ -205,7 +230,7 @@ describe('search', () => {
     await start($)
     const p = ok(await call($, 'preview', { ...FOO, paths: ['.'] }))
     expect(p.files.map((f: any) => f.path)).toEqual(['src/a.ts', 'src/d.ts'])
-    expect(p.skippedHidden).toEqual(['.hidden.ts'])
+    expect(p.skippedHidden).toBeUndefined()
   })
 
   test('more matches than maxResults is marked truncated', async ($, on) => {

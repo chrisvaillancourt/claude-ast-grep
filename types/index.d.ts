@@ -85,6 +85,8 @@ export type CorpusCase = {
   fix?: string
   maxResults: number
   paths: string[]
+  /** Every `--globs` value of a path scan, the mod's `!.*` included. */
+  globs: string[]
   stdin?: string
   result: {
     exitCode: number

@@ -32,7 +32,7 @@ describe('rule and argv', () => {
     expect(scanArgv({ binary: 'ast-grep', config: '/p/assets/sgconfig.yml', rule, maxResults: 51, paths: ['-src', 'b'], globs: ['*.ts', '!x'] })).toEqual([
       'ast-grep', 'scan', '--inline-rules', rule, '--config', '/p/assets/sgconfig.yml', '--custom-languages', 'ignore',
       '--json=compact', '--max-results', '51', '--threads', '2', '--color', 'never',
-      '--globs', '*.ts', '--globs', '!x', '--', '-src', 'b',
+      '--globs', '*.ts', '--globs', '!x', '--globs', '!.*', '--', '-src', 'b',
     ])
     expect(scanArgv({ binary: 'ast-grep', config: 'c', rule, maxResults: 3, stdin: true }).slice(-1)).toEqual(['--stdin'])
   })
@@ -44,13 +44,19 @@ describe('corpus', () => {
     expect(parseScan(run('search-basic').result, { rewrite: false })).toEqual({
       ok: true,
       matches: [
-        // ast-grep 0.51.0 reports a hidden file at the top of a scanned directory; the mod filters it (policy.ts)
-        m({ file: '.hidden.ts', start: 0, end: 6, text: 'foo(5)', captures: { A: '5' } }),
         m({ file: 'src/a.ts', start: 10, end: 16, column: 11, text: 'foo(1)', lines: 'const a = foo(1)', captures: { A: '1' } }),
         m({ file: 'src/a.ts', start: 17, end: 23, line: 2, text: 'foo(2)', captures: { A: '2' } }),
         m({ file: 'src/d.ts', start: 0, end: 6, text: 'foo(4)', captures: { A: '4' } }),
       ],
     })
+  })
+
+  test('without the mod\'s glob, a hidden file fills the result cap before visible files are searched', async () => {
+    const r = parseScan(run('raw-root').result, { rewrite: false })
+    expect(r.ok && [...new Set(r.matches.map(x => x.file))]).toEqual(['hiddenScope/.hidden.ts'])
+    expect(r.ok && r.matches.length).toBe(51)
+    const fixed = parseScan(run('limit').result, { rewrite: false })
+    expect(fixed.ok && fixed.matches.map(x => x.file)).toEqual(['visibleScope/a.ts', 'visibleScope/a.ts'])
   })
 
   test('a hidden directory named as the path is scanned', async () => {

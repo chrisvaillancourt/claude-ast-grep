@@ -5,6 +5,9 @@
 /** The most stdout the mod accepts from one run (the engine's own cut is 4 MiB). */
 export const MAX_STDOUT = 1024 * 1024
 
+/** Excludes every path segment that starts with a dot. */
+export const HIDDEN_GLOB = '!.*'
+
 export type CliMatch = {
   /** As ast-grep printed it: relative to the run's directory, or `STDIN`. */
   file: string
@@ -52,6 +55,10 @@ export function scanArgv(o: { binary: string; config: string; rule: string; maxR
   ]
   if ('stdin' in o) return [...argv, '--stdin']
   for (const g of o.globs ?? []) argv.push('--globs', g)
+  // Hidden paths are excluded by ast-grep itself, before its result cap, and
+  // after the caller's globs so a later glob can't bring them back. ast-grep
+  // 0.51.0 still scans a hidden path named explicitly (checked live).
+  argv.push('--globs', HIDDEN_GLOB)
   return [...argv, '--', ...o.paths]
 }
 

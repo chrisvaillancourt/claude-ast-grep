@@ -118,6 +118,9 @@ export function formatSearch(matches: readonly CliMatch[], max: number, skippedH
   }
   if (note) out.note = note
   if (skippedHidden.length > 0) {
+    // ast-grep excludes hidden paths itself; one it returned anyway was dropped here, after its cap.
+    out.truncated = true
+    out.note = `${out.note ? `${out.note} ` : ''}ast-grep returned hidden files that were dropped; other matches may be missing.`
     out.skippedHidden = skippedHidden.slice(0, 50)
     out.skippedHiddenCount = skippedHidden.length
   }
