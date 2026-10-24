@@ -136,6 +136,15 @@ describe('formatSearch', () => {
     })
   })
 
+  test('a $$$ capture over 50 nodes is cut and marked with its full count', async () => {
+    const nodes = Array.from({ length: 60 }, (_, i) => `a${i}`)
+    const out = JSON.parse(formatSearch([{ ...match(0), multi: { ARGS: nodes } }], 50))
+    expect(out.matches[0].multi.ARGS).toEqual(nodes.slice(0, 50))
+    expect(out.matches[0].multiTruncated).toEqual({ ARGS: 60 })
+    expect(out.capturesTruncated).toBe(true)
+    expect(out.note).toContain('cut to 50 nodes')
+  })
+
   test('none is an explicit empty result', async () => {
     expect(JSON.parse(formatSearch([], 50))).toEqual({ status: 'ok', matches: [], count: 0, truncated: false, note: 'No matches.' })
   })

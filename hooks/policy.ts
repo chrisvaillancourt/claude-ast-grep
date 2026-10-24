@@ -14,6 +14,7 @@ export const DEFAULT_RESULTS = 50
 export const MAX_RESULTS = 200
 export const MAX_SEARCH_JSON = 32 * KIB
 export const MAX_FIELD = 400
+export const MAX_MULTI_NODES = 50
 export const MAX_REPLACEMENTS = 1000
 export const MAX_FILES = 20
 export const MAX_FILE_BYTES = 256 * KIB
@@ -96,7 +97,9 @@ export function formatSearch(matches: readonly CliMatch[], max: number, skippedH
       row.captures = Object.fromEntries(Object.entries(m.captures).map(([k, v]) => [k, clip(v, MAX_FIELD)]))
     }
     if (Object.keys(m.multi).length > 0) {
-      row.multi = Object.fromEntries(Object.entries(m.multi).map(([k, v]) => [k, v.slice(0, 50).map(x => clip(x, MAX_FIELD))]))
+      row.multi = Object.fromEntries(Object.entries(m.multi).map(([k, v]) => [k, v.slice(0, MAX_MULTI_NODES).map(x => clip(x, MAX_FIELD))]))
+      const cut = Object.entries(m.multi).filter(([, v]) => v.length > MAX_MULTI_NODES)
+      if (cut.length > 0) row.multiTruncated = Object.fromEntries(cut.map(([k, v]) => [k, v.length]))
     }
     const size = enc.encode(JSON.stringify(row)).length + 1
     if (used + size > MAX_SEARCH_JSON) {
@@ -109,6 +112,10 @@ export function formatSearch(matches: readonly CliMatch[], max: number, skippedH
   }
   if (!truncated) note = rows.length === 0 ? 'No matches.' : ''
   const out: Record<string, unknown> = { status: 'ok', matches: rows, count: rows.length, truncated }
+  if (rows.some(r => r.multiTruncated !== undefined)) {
+    out.capturesTruncated = true
+    note = `${note ? `${note} ` : ''}Some $$$ captures were cut to ${MAX_MULTI_NODES} nodes; multiTruncated gives each one's full count.`
+  }
   if (note) out.note = note
   if (skippedHidden.length > 0) {
     out.skippedHidden = skippedHidden.slice(0, 50)
