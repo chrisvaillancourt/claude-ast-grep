@@ -1,7 +1,7 @@
 // Pure decisions and text: options, bounds, tool input checks, the /ast-grep
 // command, status, results. No `$`, no I/O; register.ts wires them to events.
 import type { CliMatch } from './cli'
-import type { Config, Mode, Preview, Session } from '../types'
+import type { Config, FileStatus, Mode, Preview, Session } from '../types'
 
 const KIB = 1024
 
@@ -295,3 +295,155 @@ export const TOOLS = {
     },
   },
 } as const
+
+// ---------- the preview lifecycle: one state machine ----------
+//
+// Every change to the session record goes through `transition`, applied inside
+// one versioned `update` (register.ts `step`). A preview keeps the epoch it was
+// published under; it has authority only while that epoch is the session's and
+// the tools are on. `/ast-grep off` bumps the epoch, so nothing begun before it
+// (a preview being built, an apply, a refused apply asking to stay pending) can
+// act again, and `on` never restores it.
+
+export type Where = { sessionId: string; root: string }
+
+export type LifeEvent =
+  | { type: 'publish'; preview: Preview; epoch: number; where: Where; now: number }
+  | { type: 'applyStart'; id: string; runId: string; epoch: number; where: Where; now: number; live: boolean }
+  | { type: 'writeAuthorized'; id: string; runId: string; index: number; where: Where }
+  | { type: 'writeResult'; id: string; runId: string; index: number; status: FileStatus; note?: string }
+  | { type: 'applyEnd'; id: string; runId: string; retain: boolean; summary: string }
+  | { type: 'off'; live: boolean }
+  | { type: 'on' }
+  | { type: 'clear' }
+  | { type: 'discard'; id: string | null; live: boolean }
+  | { type: 'expire'; now: number }
+  | { type: 'reload' }
+
+export type LifeAction =
+  | { kind: 'published' | 'applying' | 'authorized' | 'recorded' | 'kept' | 'discarded' | 'interrupted' }
+  | { kind: 'dropped'; preview: Preview; why: string }
+  | { kind: 'denied'; code: ErrorCode; message: string }
+
+export type Step = { record: Session; actions: LifeAction[] }
+
+const deny = (record: Session, code: ErrorCode, message: string, more: LifeAction[] = []): Step =>
+  ({ record, actions: [...more, { kind: 'denied', code, message }] })
+
+const drop = (s: Session, why: string, last?: string): Step =>
+  s.preview
+    ? { record: { ...s, preview: null, last: last ?? s.last }, actions: [{ kind: 'dropped', preview: s.preview, why }] }
+    : { record: s, actions: [] }
+
+/** Whether `p` still holds authority in `s`: its own epoch is the current one and the tools are on. */
+function current(s: Session, p: Preview, config: Config): boolean {
+  return p.epoch === s.epoch && isActive(config, s)
+}
+
+const sameWhere = (p: { sessionId: string; root: string }, w: Where) => p.sessionId === w.sessionId && p.root === w.root
+
+/** A pending preview that can never be applied: expired, or from an older epoch. */
+function dead(s: Session, p: Preview, now: number): boolean {
+  return p.state === 'pending' && (now >= p.expiresAt || p.epoch !== s.epoch)
+}
+
+function ownRun(s: Session, id: string, runId: string): Preview | null {
+  const p = s.preview
+  return p && p.id === id && p.runId === runId && p.state === 'applying' ? p : null
+}
+
+export function transition(s: Session, e: LifeEvent, config: Config): Step {
+  switch (e.type) {
+    case 'publish': {
+      if (e.epoch !== s.epoch) return deny(s, 'REVOKED', 'ast-grep was turned off after this preview started')
+      if (!isActive(config, s)) return deny(s, 'OFF', 'ast-grep is off for this session')
+      if (!sameWhere(e.preview, e.where)) return deny(s, 'SESSION_CHANGED', 'the conversation or its directory changed while previewing')
+      const held = s.preview
+      let base: Step = { record: s, actions: [] }
+      if (held) {
+        if (!dead(s, held, e.now)) return deny(s, 'PREVIEW_PENDING', `Preview ${held.id} became pending meanwhile; apply or discard it first.`)
+        base = drop(s, 'replaced: it had expired or was revoked')
+      }
+      return { record: { ...base.record, preview: { ...e.preview, epoch: s.epoch } }, actions: [...base.actions, { kind: 'published' }] }
+    }
+    case 'applyStart': {
+      const p = s.preview
+      if (!p || p.id !== e.id) {
+        return deny(s, 'UNKNOWN_PREVIEW', p ? `No preview ${e.id}; the pending one is ${p.id}.` : `No preview ${e.id} is pending: it was applied, discarded, dropped or never made. Preview again.`)
+      }
+      if (p.state === 'applying' && e.live) return deny(s, 'BUSY', `Preview ${p.id} is being applied right now.`)
+      if (p.state !== 'pending') return deny(s, 'INTERRUPTED', `An apply of preview ${p.id} was interrupted (a reload or a failure inside the plugin); it is never resumed. Check the files, then /ast-grep discard.`)
+      if (e.epoch !== s.epoch || p.epoch !== s.epoch) {
+        const d = drop(s, 'revoked by /ast-grep off')
+        return deny(d.record, 'REVOKED', `Preview ${p.id} was revoked by /ast-grep off and dropped. Preview again.`, d.actions)
+      }
+      if (!isActive(config, s)) return deny(s, 'OFF', 'ast-grep is off for this session (/ast-grep on turns it back on).')
+      if (!sameWhere(p, e.where)) {
+        const d = drop(s, 'another conversation or directory')
+        return deny(d.record, 'SESSION_CHANGED', `Preview ${p.id} belongs to another conversation or directory; it was dropped.`, d.actions)
+      }
+      if (e.now >= p.expiresAt) {
+        const d = drop(s, 'expired')
+        return deny(d.record, 'EXPIRED', `Preview ${p.id} expired (previews last 15 minutes); it was dropped. Preview again.`, d.actions)
+      }
+      return { record: { ...s, preview: { ...p, state: 'applying', runId: e.runId } }, actions: [{ kind: 'applying' }] }
+    }
+    case 'writeAuthorized': {
+      const p = ownRun(s, e.id, e.runId)
+      if (!p) return deny(s, 'SESSION_CHANGED', 'the apply lost its preview (cleared, discarded or the conversation changed) before this write')
+      if (p.epoch !== s.epoch) return deny(s, 'REVOKED', 'ast-grep was turned off during the apply')
+      if (!isActive(config, s)) return deny(s, 'OFF', 'ast-grep is off for this session')
+      if (!sameWhere(p, e.where)) return deny(s, 'SESSION_CHANGED', `the conversation or its directory changed (${p.root} -> ${e.where.root}) before this write`)
+      const files = p.files.map((f, k) => (k === e.index ? { ...f, status: 'writing' as const } : f))
+      return { record: { ...s, preview: { ...p, files } }, actions: [{ kind: 'authorized' }] }
+    }
+    case 'writeResult': {
+      const p = ownRun(s, e.id, e.runId)
+      if (!p) return { record: s, actions: [] }
+      const files = p.files.map((f, k) => {
+        if (k !== e.index) return f
+        const { note: _old, ...rest } = f
+        return e.note ? { ...rest, status: e.status, note: e.note } : { ...rest, status: e.status }
+      })
+      return { record: { ...s, preview: { ...p, files } }, actions: [{ kind: 'recorded' }] }
+    }
+    case 'applyEnd': {
+      const p = ownRun(s, e.id, e.runId)
+      if (!p) return { record: s, actions: [] }
+      if (e.retain && current(s, p, config)) {
+        const files = p.files.map(f => {
+          const { note: _n, ...rest } = f
+          return { ...rest, status: 'unstarted' as const }
+        })
+        return { record: { ...s, last: e.summary, preview: { ...p, state: 'pending', runId: null, files } }, actions: [{ kind: 'kept' }] }
+      }
+      return drop(s, e.retain ? 'revoked by /ast-grep off during the apply' : 'used', e.summary)
+    }
+    case 'off': {
+      const next = { ...s, mode: 'off' as const, epoch: s.epoch + 1 }
+      const p = s.preview
+      // A running apply keeps its record so it can report; it has lost authority (epoch) and ends dropped.
+      if (p && p.state === 'applying' && e.live) return { record: next, actions: [] }
+      return drop(next, 'turned off')
+    }
+    case 'on':
+      return { record: { ...s, mode: 'on' }, actions: [] }
+    case 'clear':
+      return { record: { ...INITIAL, mode: s.mode, epoch: s.epoch + 1 }, actions: [] }
+    case 'discard': {
+      const p = s.preview
+      if (!p || (e.id !== null && p.id !== e.id)) return deny(s, 'UNKNOWN_PREVIEW', `No preview ${e.id ?? ''} is pending.`.replace('  ', ' '))
+      if (p.state === 'applying' && e.live) return deny(s, 'BUSY', `Preview ${p.id} is being applied right now.`)
+      return { record: { ...s, preview: null }, actions: [{ kind: 'discarded' }] }
+    }
+    case 'expire': {
+      const p = s.preview
+      return p && dead(s, p, e.now) ? drop(s, p.epoch !== s.epoch ? 'revoked' : 'expired') : { record: s, actions: [] }
+    }
+    case 'reload': {
+      const p = s.preview
+      if (!p || p.state !== 'applying') return { record: s, actions: [] }
+      return { record: { ...s, preview: { ...p, state: 'interrupted' } }, actions: [{ kind: 'interrupted' }] }
+    }
+  }
+}

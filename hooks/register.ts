@@ -23,11 +23,12 @@ import {
   previewText,
   relativeTo,
   statusText,
+  transition,
   validatePreview,
   validatePreviewId,
   validateSearch,
 } from './policy'
-import type { ErrorCode } from './policy'
+import type { ErrorCode, LifeEvent, Step } from './policy'
 import type { Config, FileStatus, Preview, PreviewFile, Session } from '../types'
 
 const NAME = 'ast-grep'
@@ -38,7 +39,7 @@ const DISCARD = 'mcp__ast-grep__discard'
 
 // Change the shape tag when Session's fields change: a value an older version
 // stored (it outlives a hot reload) then reads as INITIAL instead of breaking.
-const sessionAtom = atom({ plugin: 'ast-grep', key: 'session' } as const, INITIAL, { shape: 'session-3' })
+const sessionAtom = atom({ plugin: 'ast-grep', key: 'session' } as const, INITIAL, { shape: 'session-4' })
 
 // Module variables reset on a hot reload; register and session.start run again then.
 let config: Config = configFrom({})
@@ -164,29 +165,24 @@ async function guard($: EngineInterface, e: { agentId?: string }): Promise<Sessi
   return s
 }
 
-/** The pending preview `id` or the reason there isn't one. Drops an expired or foreign one. */
-async function pendingPreview($: EngineInterface, id: string, where: Where): Promise<Preview> {
-  const p = (await read($, sessionAtom)).preview
-  if (!p || p.id !== id) {
-    throw new Refusal('UNKNOWN_PREVIEW', p ? `No preview ${id}; the pending one is ${p.id}.` : `No preview ${id} is pending: it was applied, discarded, dropped or never made. Preview again.`)
-  }
-  if (p.state === 'applying') {
-    if (p.runId && liveRuns.has(p.runId)) throw new Refusal('BUSY', `Preview ${id} is being applied right now.`)
-    throw new Refusal('INTERRUPTED', `An apply of preview ${id} was interrupted by a reload; it is never resumed. Check the files, then /ast-grep discard.`, { files: fileReport(p.files) })
-  }
-  if (p.sessionId !== where.sessionId || p.root !== where.root) {
-    await dropPreview($, id)
-    throw new Refusal('SESSION_CHANGED', `Preview ${id} belongs to another conversation or directory; it was dropped.`)
-  }
-  if ((await $.clock.now()) >= p.expiresAt) {
-    await dropPreview($, id)
-    throw new Refusal('EXPIRED', `Preview ${id} expired (previews last 15 minutes); it was dropped. Preview again.`)
-  }
-  return p
+/** Applies one lifecycle event in one versioned update; returns what the transition did. */
+async function step($: EngineInterface, ev: LifeEvent): Promise<Step> {
+  let out: Step = { record: INITIAL, actions: [] }
+  await update($, sessionAtom, s => {
+    out = transition(s, ev, config)
+    return out.record
+  })
+  return out
 }
 
-async function dropPreview($: EngineInterface, id: string, last?: string) {
-  await update($, sessionAtom, s => (s.preview?.id === id ? { ...s, preview: null, last: last ?? s.last } : s))
+function denialOf(st: Step): { code: ErrorCode; message: string } | null {
+  for (const a of st.actions) if (a.kind === 'denied') return { code: a.code, message: a.message }
+  return null
+}
+
+/** Whether the run that holds the session's applying preview is alive in this copy of the module. */
+function isLive(s: Session): boolean {
+  return s.preview?.state === 'applying' && s.preview.runId !== null && liveRuns.has(s.preview.runId)
 }
 
 function fileReport(files: readonly PreviewFile[]) {
@@ -213,10 +209,10 @@ async function preview($: EngineInterface, e: Record<string, unknown> & { agentI
   const s = await guard($, e)
   const q = validatePreview(e)
   if (!q.ok) throw new Refusal('INVALID_INPUT', q.error)
-  const busy = s.preview
-  if (busy && (busy.state === 'applying' || (await $.clock.now()) < busy.expiresAt)) {
-    throw new Refusal('PREVIEW_PENDING', `Preview ${busy.id} is still pending; apply or discard it first.`)
-  }
+  // Fail fast; the publish transition decides again at the end.
+  await step($, { type: 'expire', now: await $.clock.now() })
+  const busy = (await read($, sessionAtom)).preview
+  if (busy) throw new Refusal('PREVIEW_PENDING', `Preview ${busy.id} is still pending; apply or discard it first.`)
   const where = await whereNow($)
   await ensureCli($)
   const paths = await scopePaths($, where.root, q.value.paths)
@@ -275,8 +271,10 @@ async function preview($: EngineInterface, e: Record<string, unknown> & { agentI
   const p: Preview = {
     id: newId('ag'), sessionId: where.sessionId, root: where.root, createdAt: at, expiresAt: at + PREVIEW_TTL_MS,
     pattern: q.value.pattern, rewrite: q.value.rewrite, language: q.value.language, replacements, files, state: 'pending', runId: null,
+    epoch: s.epoch,
   }
-  const denied = await authorize($, { ...where, epoch: s.epoch }, { kind: 'publish', preview: p })
+  const now = await whereNow($).catch(() => ({ sessionId: '', root: '' }))
+  const denied = denialOf(await step($, { type: 'publish', preview: p, epoch: s.epoch, where: now, now: at }))
   if (denied) throw new Refusal(denied.code, denied.code === 'PREVIEW_PENDING' ? denied.message : `No preview was kept: ${denied.message}.`)
   log($, `preview ${p.id}: ${replacements} replacements in ${files.length} files`)
   const out = JSON.parse(previewText(p, diff)) as Record<string, unknown>
@@ -288,64 +286,16 @@ async function preview($: EngineInterface, e: Record<string, unknown> & { agentI
   return JSON.stringify(out)
 }
 
-/** The facts an operation started from; it may act only while they still hold. */
-type Op = { sessionId: string; root: string; epoch: number }
-
-/** What an operation asks to do: publish its preview, or issue the Write of file `index` of a run. */
-type Act = { kind: 'publish'; preview: Preview } | { kind: 'write'; id: string; runId: string; index: number }
-
-type Denial = { code: ErrorCode; message: string }
-
-/** Whether `act` may happen in state `s`, or why not. Pure: the one rule for write authority. */
-function decide(s: Session, op: Op, act: Act, now: number): Denial | null {
-  if (s.epoch !== op.epoch) return { code: 'REVOKED', message: 'ast-grep was turned off after this operation started' }
-  if (!isActive(config, s)) return { code: 'OFF', message: 'ast-grep is off for this session' }
-  if (act.kind === 'publish') {
-    const held = s.preview
-    if (held && (held.state === 'applying' || now < held.expiresAt)) {
-      return { code: 'PREVIEW_PENDING', message: `Preview ${held.id} became pending meanwhile; apply or discard it first.` }
-    }
-    return null
-  }
-  const p = s.preview
-  if (!p || p.id !== act.id || p.state !== 'applying' || p.runId !== act.runId) {
-    return { code: 'SESSION_CHANGED', message: 'the apply lost its preview (cleared, discarded or the conversation changed) before this write' }
-  }
-  return null
-}
-
-function transition(s: Session, act: Act): Session {
-  if (act.kind === 'publish') return { ...s, preview: act.preview }
-  const p = s.preview!
-  return { ...s, preview: { ...p, files: p.files.map((f, k) => (k === act.index ? { ...f, status: 'writing' as const } : f)) } }
-}
-
 /**
- * The single authorization step before a side effect: the session and its
- * directory are still the ones `op` started in, then one versioned update
- * decides and, when allowed, applies the act (publish, or mark the file
- * `writing`). Nothing may be awaited between an allowed write and its Write call.
+ * The last step before a Write call: the current session id and resolved root,
+ * then the `writeAuthorized` transition, which allows the write only for the
+ * run that owns the preview, in the preview's own epoch, with the tools on, in
+ * the same session and directory. Nothing is awaited between an allowed write
+ * and its Write call.
  */
-async function authorize($: EngineInterface, op: Op, act: Act): Promise<Denial | null> {
-  const now = await whereNow($).catch(() => null)
-  if (!now || now.sessionId !== op.sessionId) return { code: 'SESSION_CHANGED', message: 'the conversation changed (a /clear?) before this step' }
-  if (now.root !== op.root) return { code: 'SESSION_CHANGED', message: `the session directory changed (${op.root} -> ${now.root}) before this step` }
-  const at = await $.clock.now()
-  let denial: Denial | null = null
-  await update($, sessionAtom, s => {
-    denial = decide(s, op, act, at)
-    return denial ? s : transition(s, act)
-  })
-  return denial
-}
-
-async function setFile($: EngineInterface, id: string, runId: string, i: number, status: FileStatus, note?: string) {
-  await update($, sessionAtom, s => {
-    const p = s.preview
-    if (!p || p.id !== id || p.runId !== runId) return s
-    const files = p.files.map((f, k) => (k === i ? (note ? { ...f, status, note } : { ...f, status }) : f))
-    return { ...s, preview: { ...p, files } }
-  })
+async function authorizeWrite($: EngineInterface, id: string, runId: string, index: number): Promise<{ code: ErrorCode; message: string } | null> {
+  const where = await whereNow($).catch(() => ({ sessionId: '', root: '' }))
+  return denialOf(await step($, { type: 'writeAuthorized', id, runId, index, where }))
 }
 
 type WriteOutcome = 'ok' | 'deny' | 'error' | 'threw'
@@ -367,16 +317,17 @@ async function apply($: EngineInterface, e: Record<string, unknown> & { agentId?
   if (!q.ok) throw new Refusal('INVALID_INPUT', q.error)
   const id = q.value
   const where = await whereNow($)
-  const p = await pendingPreview($, id, where)
-
   // Claim it: pending -> applying, under a run id only this copy of the module knows.
   const runId = newId('run')
-  let claimed = false
-  await update($, sessionAtom, s => {
-    claimed = s.preview?.id === id && s.preview.state === 'pending' && s.epoch === epoch
-    return claimed ? { ...s, preview: { ...s.preview!, state: 'applying' as const, runId } } : s
+  const started = await step($, {
+    type: 'applyStart', id, runId, epoch, where, now: await $.clock.now(), live: isLive(await read($, sessionAtom)),
   })
-  if (!claimed) throw new Refusal('BUSY', `Preview ${id} is no longer pending.`)
+  const refused = denialOf(started)
+  if (refused) {
+    const held = (await read($, sessionAtom)).preview
+    throw new Refusal(refused.code, refused.message, refused.code === 'INTERRUPTED' && held ? { files: fileReport(held.files) } : {})
+  }
+  const p = started.record.preview!
   liveRuns.add(runId)
   try {
     // 1. Every target unchanged, before any write.
@@ -387,15 +338,16 @@ async function apply($: EngineInterface, e: Record<string, unknown> & { agentId?
       if (snap?.hash !== f.beforeHash) changed.push(f.path)
     }
     if (changed.length > 0) {
-      await dropPreview($, id, `${id} not applied: ${changed.join(', ')} changed after the preview`)
+      await step($, { type: 'applyEnd', id, runId, retain: false, summary: `${id} not applied: ${changed.join(', ')} changed after the preview` })
       throw new Refusal('STALE', `Nothing was written: ${changed.join(', ')} changed after the preview. The preview was dropped; preview again.`, { changed })
     }
     // 2. Every write allowed by the permission check, before any write.
     for (const f of p.files) {
       const v = await $.tool.check({ tool: 'Write', input: { file_path: f.abs, content: f.after } })
       if (v.decision === 'deny') {
-        await update($, sessionAtom, s => (s.preview?.id === id && s.preview.runId === runId ? { ...s, preview: { ...s.preview, state: 'pending' as const, runId: null } } : s))
-        throw new Refusal('WRITE_DENIED', `Nothing was written: writing ${f.path} would be denied${v.reason ? ` (${v.reason})` : ''}. The preview stays pending.`, { files: fileReport(p.files) })
+        const end = await step($, { type: 'applyEnd', id, runId, retain: true, summary: `${id}: not applied, writing ${f.path} would be denied` })
+        const kept = end.actions.some(x => x.kind === 'kept')
+        throw new Refusal('WRITE_DENIED', `Nothing was written: writing ${f.path} would be denied${v.reason ? ` (${v.reason})` : ''}. ${kept ? 'The preview stays pending.' : 'The preview was revoked by /ast-grep off during the apply and dropped; preview again.'}`, { files: fileReport(p.files) })
       }
     }
     // 3. Write each file through the Write tool, then read it back.
@@ -410,7 +362,7 @@ async function apply($: EngineInterface, e: Record<string, unknown> & { agentId?
         break
       }
       // The last step before the Write: nothing is awaited between it and the call.
-      const denied = await authorize($, { sessionId: p.sessionId, root: p.root, epoch }, { kind: 'write', id, runId, index: i })
+      const denied = await authorizeWrite($, id, runId, i)
       if (denied) {
         f.status = 'not-written'
         f.note = denied.message
@@ -439,7 +391,7 @@ async function apply($: EngineInterface, e: Record<string, unknown> & { agentId?
       const o = outcome(kind, back?.hash ?? null, f, extra)
       f.status = o.status
       if (o.note) f.note = o.note
-      await setFile($, id, runId, i, o.status, o.note)
+      await step($, { type: 'writeResult', id, runId, index: i, status: o.status, ...(o.note ? { note: o.note } : {}) })
       if (o.status !== 'written') break
       written++
     }
@@ -448,12 +400,9 @@ async function apply($: EngineInterface, e: Record<string, unknown> & { agentId?
     const stop = files.find(f => f.status !== 'written')
     // Nothing written and the first file read back unchanged after a refusal or a
     // tool error: the preview is still exact, so it stays pending for another try.
-    const keep = written === 0 && (stop?.status === 'refused' || stop?.status === 'failed')
-    if (keep) {
-      await update($, sessionAtom, s => (s.preview?.id === id && s.preview.runId === runId
-        ? { ...s, last: summary, preview: { ...s.preview, state: 'pending' as const, runId: null, files: s.preview.files.map(f => ({ ...f, status: 'unstarted' as const })) } }
-        : s))
-    } else await dropPreview($, id, summary)
+    const retain = written === 0 && (stop?.status === 'refused' || stop?.status === 'failed')
+    const end = await step($, { type: 'applyEnd', id, runId, retain, summary })
+    const keep = end.actions.some(x => x.kind === 'kept')
     log($, `apply ${summary}`)
     if (!stop) {
       return JSON.stringify({
@@ -462,7 +411,9 @@ async function apply($: EngineInterface, e: Record<string, unknown> & { agentId?
       })
     }
     const code: ErrorCode = stop.status === 'refused' ? 'WRITE_DENIED' : 'NOT_APPLIED'
-    const after = keep ? 'The preview stays pending: apply it again once the write can go through, or discard it.' : 'The preview was dropped.'
+    const after = keep
+      ? 'The preview stays pending: apply it again once the write can go through, or discard it.'
+      : retain ? 'The preview was revoked by /ast-grep off during the apply and dropped; preview again.' : 'The preview was dropped.'
     throw new Refusal(code, `${written} of ${files.length} files written; stopped at ${stop.path} (${stop.status}${stop.note ? `: ${stop.note}` : ''}). Files after it were not touched. ${after}${written > 0 ? ' Read the written files before editing them.' : ''}`, { files: report })
   } finally {
     liveRuns.delete(runId)
@@ -473,11 +424,10 @@ async function discard($: EngineInterface, e: Record<string, unknown> & { agentI
   if (e.agentId !== undefined) throw new Refusal('SUBAGENT', 'The ast-grep tools serve the main conversation only.')
   const q = validatePreviewId(e)
   if (!q.ok) throw new Refusal('INVALID_INPUT', q.error)
-  const p = (await read($, sessionAtom)).preview
-  if (!p || p.id !== q.value) throw new Refusal('UNKNOWN_PREVIEW', `No preview ${q.value} is pending.`)
-  if (p.state === 'applying' && p.runId && liveRuns.has(p.runId)) throw new Refusal('BUSY', `Preview ${p.id} is being applied right now.`)
-  await dropPreview($, p.id)
-  return JSON.stringify({ status: 'discarded', previewId: p.id })
+  const done = await step($, { type: 'discard', id: q.value, live: isLive(await read($, sessionAtom)) })
+  const refused = denialOf(done)
+  if (refused) throw new Refusal(refused.code, refused.message)
+  return JSON.stringify({ status: 'discarded', previewId: q.value })
 }
 
 type ToolName = 'search' | 'preview' | 'apply' | 'discard'
@@ -512,12 +462,14 @@ export const register: Register = (on, options) => {
       argumentHint: '[status|on|off|discard]',
     })
     await registerTools($)
+    // A fresh copy of the module has no live apply: one left applying was interrupted.
+    await step($, { type: 'reload' })
     return next(e)
   })
 
   on('session.end', async ($, e, next) => {
     // /clear starts a new conversation in the same process: no preview carries over.
-    if (e.reason === 'clear') await update($, sessionAtom, s => ({ ...INITIAL, mode: s.mode }))
+    if (e.reason === 'clear') await step($, { type: 'clear' })
     return next(e)
   })
 
@@ -525,21 +477,18 @@ export const register: Register = (on, options) => {
     const cmd = parseArgs(e.args)
     if (cmd.kind === 'help') return { text: cmd.error ? `${cmd.error}\n${USAGE}` : USAGE }
     if (cmd.kind === 'set') {
-      await update($, sessionAtom, s => {
-        const live = s.preview?.state === 'applying' && s.preview.runId !== null && liveRuns.has(s.preview.runId)
-        // Off bumps the epoch: every running operation loses its authority, and on never restores it.
-        return { ...s, mode: cmd.mode, epoch: cmd.mode === 'off' ? s.epoch + 1 : s.epoch, preview: cmd.mode === 'off' && !live ? null : s.preview }
-      })
+      const live = isLive(await read($, sessionAtom))
+      await step($, cmd.mode === 'off' ? { type: 'off', live } : { type: 'on' })
     }
     if (cmd.kind === 'discard') {
-      const p = (await read($, sessionAtom)).preview
-      if (p?.state === 'applying' && p.runId && liveRuns.has(p.runId)) return { text: `Preview ${p.id} is being applied right now; it can't be discarded.` }
-      if (p) {
-        await dropPreview($, p.id)
-        const lines = p.files.map(f => `  ${f.path}: ${f.status}${f.note ? ` (${f.note})` : ''}`)
-        return { text: [`Discarded preview ${p.id}${p.state === 'applying' ? ' (an interrupted apply)' : ''}.`, ...(p.state === 'applying' ? lines : [])].join('\n') }
-      }
-      return { text: 'No preview to discard.' }
+      const held = (await read($, sessionAtom)).preview
+      const done = await step($, { type: 'discard', id: null, live: isLive(await read($, sessionAtom)) })
+      const refused = denialOf(done)
+      if (refused?.code === 'BUSY') return { text: `${refused.message} It can't be discarded.` }
+      if (refused || !held) return { text: 'No preview to discard.' }
+      const lines = held.files.map(f => `  ${f.path}: ${f.status}${f.note ? ` (${f.note})` : ''}`)
+      const broken = held.state !== 'pending'
+      return { text: [`Discarded preview ${held.id}${broken ? ' (an interrupted apply)' : ''}.`, ...(broken ? lines : [])].join('\n') }
     }
     return { text: statusText(config, await read($, sessionAtom), (await $.clock.now()), version) }
   }).catch(() => ({ text: "The command failed inside the plugin; run with --debug for the reason." }))

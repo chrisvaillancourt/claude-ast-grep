@@ -33,7 +33,7 @@ type Hooks = {
   onStdinScan?: ($: any) => unknown
 }
 
-function world(on: On, opts: { files?: Record<string, File>; write?: (path: string) => WriteMode; check?: (path: string) => 'allow' | 'deny'; noBinary?: boolean } & Hooks = {}) {
+function world(on: On, opts: { files?: Record<string, File>; write?: (path: string) => WriteMode | Promise<WriteMode>; check?: (path: string) => 'allow' | 'deny' | Promise<'allow' | 'deny'>; noBinary?: boolean } & Hooks = {}) {
   const files = new Map<string, File>(Object.entries({ ...PROJECT, ...opts.files }).map(([k, v]) => [`${ROOT}/${k}`, v]))
   const dirs = new Set([ROOT, `${ROOT}/src`, `${ROOT}/src/.cache`, '/w2'])
   const reads = new Map<string, number>()
@@ -99,11 +99,11 @@ function world(on: On, opts: { files?: Record<string, File>; write?: (path: stri
   on('tool.check', async ($, e) => {
     const path = (e.input as { file_path: string }).file_path
     await opts.onCheck?.($, path)
-    return { decision: opts.check?.(path) ?? 'allow' }
+    return { decision: (await opts.check?.(path)) ?? 'allow' }
   })
   on('tool.call', async ($, e) => {
     if (e.tool !== 'Write') throw new Error(`unexpected tool ${e.tool}`)
-    const mode = opts.write?.(e.file_path) ?? 'ok'
+    const mode = (await opts.write?.(e.file_path)) ?? 'ok'
     if (mode === 'deny') return { deny: `Permission to write ${e.file_path} was denied.` }
     if (mode === 'error') return { result: 'disk full', text: 'disk full', isError: true } as never
     seen.writes.push({ path: e.file_path, content: e.content })
@@ -500,5 +500,43 @@ describe('write authority', () => {
     expect(ok(await call($, 'apply', { previewId: id })).status).toBe('applied')
     expect(inner.apply.code).toBe('BUSY')
     expect(inner.discard.code).toBe('BUSY')
+  })
+
+  test('off then on during the permission preflight, which denies: the preview is gone and a retry writes nothing', async ($, on) => {
+    let first = true
+    const seen = world(on, {
+      check: async () => {
+        if (!first) return 'allow'
+        first = false
+        await $.command.run({ command: 'ast-grep', args: 'off', ...COMMAND })
+        await $.command.run({ command: 'ast-grep', args: 'on', ...COMMAND })
+        return 'deny'
+      },
+    })
+    await start($)
+    const p = ok(await call($, 'preview', { ...FOO, paths: ['src'] }))
+    const e = err(await call($, 'apply', { previewId: p.previewId }))
+    expect(e.message).not.toContain('stays pending')
+    expect(err(await call($, 'apply', { previewId: p.previewId })).code).toBe('UNKNOWN_PREVIEW')
+    expect(seen.writes).toEqual([])
+  })
+
+  test('off then on during the first Write, which is refused: the preview is gone and a retry writes nothing', async ($, on) => {
+    let first = true
+    const seen = world(on, {
+      write: async () => {
+        if (!first) return 'ok'
+        first = false
+        await $.command.run({ command: 'ast-grep', args: 'off', ...COMMAND })
+        await $.command.run({ command: 'ast-grep', args: 'on', ...COMMAND })
+        return 'deny'
+      },
+    })
+    await start($)
+    const p = ok(await call($, 'preview', { ...FOO, paths: ['src'] }))
+    const e = err(await call($, 'apply', { previewId: p.previewId }))
+    expect(e.message).not.toContain('stays pending')
+    expect(err(await call($, 'apply', { previewId: p.previewId })).code).toBe('UNKNOWN_PREVIEW')
+    expect(seen.writes).toEqual([])
   })
 })

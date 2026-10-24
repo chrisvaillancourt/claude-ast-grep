@@ -41,7 +41,7 @@ describe('options and command', () => {
   test('status names the state, the version and the pending preview', async () => {
     const preview = {
       id: 'p1', sessionId: 's', root: '/r', createdAt: 0, expiresAt: 10 * 60_000, pattern: 'foo($A)', rewrite: 'bar($A)', language: 'ts',
-      replacements: 3, files: [], state: 'pending' as const, runId: null,
+      replacements: 3, files: [], state: 'pending' as const, runId: null, epoch: 0,
     }
     const text = statusText(configFrom({}), { ...INITIAL, preview, last: 'applied p0: 1 written' }, 60_000, 'ast-grep 0.51.0')
     expect(text).toBe(

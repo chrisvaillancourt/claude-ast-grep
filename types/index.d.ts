@@ -52,8 +52,13 @@ export type Preview = {
   language: string
   replacements: number
   files: PreviewFile[]
-  /** `applying` while an apply owns it; `runId` names that apply. */
-  state: 'pending' | 'applying'
+  /** The session epoch it was published under; it has authority only while that is still the session's. */
+  epoch: number
+  /**
+   * `applying` while an apply owns it (`runId` names that apply); `interrupted`
+   * once a reload or a failure inside the plugin ended an apply mid-way.
+   */
+  state: 'pending' | 'applying' | 'interrupted'
   runId: string | null
 }
 
