@@ -392,17 +392,25 @@ async function apply($: EngineInterface, e: Record<string, unknown> & { agentId?
     }
     const report = fileReport(files)
     const summary = `${id}: ${written} of ${files.length} files written`
-    await dropPreview($, id, summary)
+    const stop = files.find(f => f.status !== 'written')
+    // Nothing written and the first file read back unchanged after a refusal or a
+    // tool error: the preview is still exact, so it stays pending for another try.
+    const keep = written === 0 && (stop?.status === 'refused' || stop?.status === 'failed')
+    if (keep) {
+      await update($, sessionAtom, s => (s.preview?.id === id && s.preview.runId === runId
+        ? { ...s, last: summary, preview: { ...s.preview, state: 'pending' as const, runId: null, files: s.preview.files.map(f => ({ ...f, status: 'unstarted' as const })) } }
+        : s))
+    } else await dropPreview($, id, summary)
     log($, `apply ${summary}`)
-    if (written === files.length) {
+    if (!stop) {
       return JSON.stringify({
         status: 'applied', previewId: id, files: report,
         note: `Wrote ${written} files exactly as previewed. Read a file before editing it with Edit: this conversation has not seen its new content.`,
       })
     }
-    const stop = files.find(f => f.status !== 'written')!
     const code: ErrorCode = stop.status === 'refused' ? 'WRITE_DENIED' : 'NOT_APPLIED'
-    throw new Refusal(code, `${written} of ${files.length} files written; stopped at ${stop.path} (${stop.status}${stop.note ? `: ${stop.note}` : ''}). Files after it were not touched. The preview was dropped.${written > 0 ? ' Read the written files before editing them.' : ''}`, { files: report })
+    const after = keep ? 'The preview stays pending: apply it again once the write can go through, or discard it.' : 'The preview was dropped.'
+    throw new Refusal(code, `${written} of ${files.length} files written; stopped at ${stop.path} (${stop.status}${stop.note ? `: ${stop.note}` : ''}). Files after it were not touched. ${after}${written > 0 ? ' Read the written files before editing them.' : ''}`, { files: report })
   } finally {
     liveRuns.delete(runId)
   }

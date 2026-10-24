@@ -8,7 +8,7 @@ Each file is written through Claude Code's own Write tool, so your permission ru
 
 - **`mcp__ast-grep__search`** `{ pattern, language, paths?, globs?, maxResults? }`: matches of one pattern in one language under the session's directory. Each match has its file, 1-based line and column, matched text, the source lines it spans, and the captured metavariables. Read-only.
 - **`mcp__ast-grep__preview`** `{ pattern, rewrite, language, paths, globs? }`: computes a rewrite without touching any file and returns a preview id, its expiry, the files and replacement counts, and the complete unified diff. `rewrite` may be empty (deletes each match).
-- **`mcp__ast-grep__apply`** `{ previewId }`: writes the preview. Before the first write it re-reads every target and compares its SHA-256 with the hash taken at preview time; if any file differs, nothing is written and the preview is dropped. Then each file is written with the built-in Write tool, re-read and hashed again. The result lists every file as `written`, `refused`, `failed`, `not-written` or `differs`, and says to Read a file before editing it.
+- **`mcp__ast-grep__apply`** `{ previewId }`: writes the preview. Before the first write it re-reads every target and compares its SHA-256 with the hash taken at preview time; if any file differs, nothing is written and the preview is dropped. Then each file is written with the built-in Write tool, re-read and hashed again. The result lists every file as `written`, `refused`, `failed`, `not-written`, `differs`, `unknown` or `unstarted` (never reached), and says to Read a file before editing it. Anything short of every file `written` comes back as an error result.
 - **`mcp__ast-grep__discard`** `{ previewId }`: drops a pending preview.
 - One preview may be pending at a time; a second preview is refused until the first is applied or discarded. A preview expires after 15 minutes, and `/clear`, `/ast-grep off` and `/ast-grep discard` drop it.
 - The tools serve the main conversation only. A subagent's call is refused with an error.
@@ -17,7 +17,7 @@ Each file is written through Claude Code's own Write tool, so your permission ru
 ### How a rewrite is computed
 
 1. `ast-grep scan` runs over the paths with a rule the mod writes itself (`--inline-rules` with one pattern, the language and the rewrite as `fix`) and a config file the mod ships (`assets/sgconfig.yml`), so a repository's own `sgconfig.yml`, rule files and custom languages never change the operation. Arguments go to the CLI as an argument vector, never through a shell. The mod uses `scan`, not `run`: `run` exits 0 with no matches on an invalid pattern.
-2. Each matching file is checked (a regular file, no symbolic link on its path, inside the session's directory, at most 256 KiB, valid UTF-8 with no NUL byte) and read once. ast-grep then runs again on that snapshot through stdin, so the replacements belong to exactly the bytes that were read.
+2. Each matching file is checked (a regular file, no symbolic link on its path, inside the session's directory, at most 256 KiB, valid UTF-8 with no NUL byte and no byte-order mark) and read once. ast-grep then runs again on that snapshot through stdin, so the replacements belong to exactly the bytes that were read.
 3. The replacements are applied by UTF-8 byte offset, from the end of the file to the start. Overlapping replacements (a rewrite of `foo($A)` over `foo(foo(1))`) are refused: no preview id. Untouched bytes stay as they were, line endings and a missing final newline included.
 4. The diff is computed from the stored before and after text. It is exact (applying it gives the stored after text) but not always minimal: unchanged lines between two nearby replacements can show as removed and added.
 
@@ -25,9 +25,9 @@ Each file is written through Claude Code's own Write tool, so your permission ru
 
 Apply calls the built-in Write tool once per file, as the plugin's own tool call. That call goes through the same permission path as the model's Write: allow and deny rules, the permission mode, the prompt in an interactive session, the auto-mode classifier, and `PreToolUse` hooks. Before any write the mod also asks the permission check (`$.tool.check`) about every file and refuses the whole apply when one would be denied.
 
-- A refused write (a deny rule, a declined prompt, a headless session in the default mode) stops the apply at that file. Files before it stay written, and the result says which.
+- A refused write (a deny rule, a declined prompt, a headless session in the default mode) stops the apply at that file. Files before it stay written, and the result says which. When nothing was written yet (the first file was refused, or the Write tool failed on it and the file is unchanged), the preview stays pending, so the same id can be applied once the write is allowed.
 - A write the person edited in the prompt, or one held for review instead of written (`staged`), is reported as `differs` or `not-written` after the file is re-read: never as written.
-- In a headless session (`claude -p`) in the default permission mode the first write is refused and nothing is written. `--permission-mode acceptEdits`, or a `Write` allow rule, lets apply write.
+- In a headless session (`claude -p`) in the default permission mode the first write is refused and nothing is written. `--permission-mode acceptEdits`, or a `Write` allow rule, lets apply write. (Checked on Claude Code 2.1.310.)
 
 The writes are sequential, not a transaction. Every target is checked before the first write and again right before its own write, which narrows the window for a concurrent change but does not close it: another program writing a target between that check and the write is not detected until the re-read afterwards. A failure part way through leaves the earlier files written; the mod does not roll them back.
 
@@ -35,7 +35,7 @@ The writes are sequential, not a transaction. Every target is checked before the
 
 No model calls. Each tool call runs the local ast-grep CLI: one process for a search, and for a preview one discovery scan plus one per changed file (at most 21). The results are ordinary tool-result tokens: a search result is at most 32 KiB of JSON, a preview at most a 64 KiB diff plus its summary.
 
-The four tools are registered once when the session starts and stay the same for the whole session. They are deferred behind ToolSearch by default, so each request carries only their names until the model loads them. Set `alwaysLoaded` to put their schemas in every request instead (about 1,500 tokens more per request).
+The four tools are registered once when the session starts and stay the same for the whole session. They are deferred behind ToolSearch by default, so each request carries only their names until the model loads them. Set `alwaysLoaded` to put their full schemas in every request instead, which costs input tokens on every request of the session.
 
 ### What it never does
 
@@ -52,7 +52,7 @@ Out of contract:
 
 - YAML rules, rule files, `constraints`, `transform`, relational rules (`inside`, `has`), several rewrites in one call, mixed languages in one call.
 - A repository's `sgconfig.yml`, custom languages and `utils`: ignored on purpose.
-- Files outside the session's directory, symbolic links, hard-link aliases, binary or invalid UTF-8 files, files over 256 KiB.
+- Files outside the session's directory, symbolic links, hard-link aliases, binary or invalid UTF-8 files, files with a byte-order mark, files over 256 KiB.
 - Semantic or type-aware refactoring; a guarantee that the rewritten code parses.
 - File metadata (mode, timestamps) beyond what the Write tool keeps.
 - An atomic multi-file write, rollback, crash recovery, or protection against a program writing the same files while apply runs.
@@ -83,7 +83,7 @@ Fixed bounds:
 | Paths, globs | 16 each |
 | Search matches | 50 by default, `maxResults` up to 200; more is reported as `truncated` |
 | Search result | 32 KiB of JSON; matches past it are dropped and the result says `truncated` |
-| Matched text and source lines in a search result | 400 characters each, marked when cut |
+| Matched text, source lines and captures in a search result | 400 characters each, marked when cut; at most 50 nodes per `$$$` capture |
 | Replacements in one preview | 1,000 |
 | Changed files in one preview | 20 |
 | One changed file | 256 KiB |
@@ -104,8 +104,8 @@ ast-grep 0.51.0 or newer on `PATH` (`brew install ast-grep`, `cargo install ast-
 - A partial apply is not rolled back. Claude Code's own file history (rewind) may hold the earlier content; the mod keeps no copy of its own once the apply ends.
 - A reload during an apply leaves an `interrupted` record listing what was known about each file; the mod never resumes it. `/ast-grep discard` clears it.
 - Tools are refused in subagents.
-- The apply-then-Edit behavior (whether the built-in Edit accepts a file the mod wrote without a fresh Read) depends on the engine; the result tells the model to Read first either way.
-- Checked live on Claude Code 2.1.310 in headless sessions only; the interactive permission prompt for apply has not been checked live yet.
+- On Claude Code 2.1.310 the built-in Edit accepted a file the mod had just written without a fresh Read (the Write call refreshes the engine's record of the file), even though the conversation never saw the new content. The apply result tells the model to Read first anyway.
+- Checked live on Claude Code 2.1.310 in headless sessions only (search, preview, apply on CRLF, non-ASCII and no-final-newline files; a stale target; a refused write). The interactive permission prompt for apply, an edited proposal (`userModified`) and a reload during an apply have not been checked live yet; the test kit covers them.
 
 ## Install
 

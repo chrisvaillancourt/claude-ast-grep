@@ -288,8 +288,9 @@ describe('preview and apply', () => {
     expect(seen.writes).toEqual([])
   })
 
-  test('a refused write stops the apply; nothing is reported as written that was not', async ($, on) => {
-    const seen = world(on, { write: p => (p.endsWith('a.ts') ? 'deny' : 'ok') })
+  test('a refused first write stops the apply with zero writes and keeps the preview pending', async ($, on) => {
+    let refusing = true
+    const seen = world(on, { write: p => (refusing && p.endsWith('a.ts') ? 'deny' : 'ok') })
     await start($)
     const p = ok(await call($, 'preview', { ...FOO, paths: ['src'] }))
     const e = err(await call($, 'apply', { previewId: p.previewId }))
@@ -297,8 +298,12 @@ describe('preview and apply', () => {
       code: 'WRITE_DENIED',
       files: [{ path: 'src/a.ts', status: 'refused' }, { path: 'src/d.ts', status: 'unstarted' }],
     })
+    expect(e.message).toContain('The preview stays pending')
     expect(text(seen, 'src/a.ts')).toBe('const a = foo(1)\nfoo(2)\n')
     expect(text(seen, 'src/d.ts')).toBe('foo(4)\n')
+    refusing = false
+    expect(ok(await call($, 'apply', { previewId: p.previewId })).status).toBe('applied')
+    expect(text(seen, 'src/d.ts')).toBe('bar(4)\n')
   })
 
   test('a later refusal leaves the earlier file written, and says so', async ($, on) => {
