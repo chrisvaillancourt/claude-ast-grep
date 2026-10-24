@@ -1,0 +1,4 @@
+# The config every ast-grep call of the mod names with --config, so a
+# repository's own sgconfig.yml, rule directories, utils and custom languages
+# never change what the mod's generated rule does.
+ruleDirs: []

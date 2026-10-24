@@ -7,8 +7,26 @@
     "enabled": {
       "type": "boolean",
       "title": "Enabled",
-      "description": "Turn the mod on for new sessions. /ast-grep on|off overrides it for a session.",
+      "description": "Turn the ast-grep tools on for new sessions. /ast-grep on|off overrides it for a session.",
       "default": true
+    },
+    "alwaysLoaded": {
+      "type": "boolean",
+      "title": "Always loaded",
+      "description": "Put the four tools' schemas in every request instead of behind ToolSearch.",
+      "default": false
+    },
+    "binary": {
+      "type": "string",
+      "title": "ast-grep binary",
+      "description": "The ast-grep executable: a name on PATH or an absolute path.",
+      "default": "ast-grep"
+    },
+    "timeoutSeconds": {
+      "type": "number",
+      "title": "Timeout (seconds)",
+      "description": "Time limit for each ast-grep process, 5 to 300.",
+      "default": 30
     }
   },
   "author": {
