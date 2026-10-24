@@ -20,9 +20,21 @@ const PROJECT: Record<string, File> = {
 }
 
 /** The engine beneath the plugin: a small file system, ast-grep replaying the corpus, and the Write tool. */
-function world(on: On, opts: { files?: Record<string, File>; write?: (path: string) => WriteMode; check?: (path: string) => 'allow' | 'deny'; noBinary?: boolean } = {}) {
+type Hooks = {
+  /** Runs inside the engine's answer to a read of `path`, the `n`th read of that path. */
+  onRead?: ($: any, path: string, n: number) => unknown
+  /** Runs inside the permission check of a Write. */
+  onCheck?: ($: any, path: string) => unknown
+  /** Runs after a Write landed. */
+  afterWrite?: ($: any, path: string) => unknown
+  /** Runs inside an ast-grep stdin run. */
+  onStdinScan?: ($: any) => unknown
+}
+
+function world(on: On, opts: { files?: Record<string, File>; write?: (path: string) => WriteMode; check?: (path: string) => 'allow' | 'deny'; noBinary?: boolean } & Hooks = {}) {
   const files = new Map<string, File>(Object.entries({ ...PROJECT, ...opts.files }).map(([k, v]) => [`${ROOT}/${k}`, v]))
-  const dirs = new Set([ROOT, `${ROOT}/src`])
+  const dirs = new Set([ROOT, `${ROOT}/src`, '/w2'])
+  const reads = new Map<string, number>()
   const seen = {
     tools: [] as { name: string; isDeferred?: boolean }[],
     commands: [] as string[],
@@ -30,13 +42,14 @@ function world(on: On, opts: { files?: Record<string, File>; write?: (path: stri
     writes: [] as { path: string; content: string }[],
     files,
     sessionId: 's1',
+    cwd: ROOT,
     clock: mock.clock(on),
   }
   const abs = (p: string) => (p.startsWith('/') ? p : `${ROOT}/${p}`).replace(/\/\.$/, '').replace(/\/$/, '')
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('session.end', ($, e) => ({ sessionId: e.sessionId }))
   on('session.id', () => ({ value: seen.sessionId }))
-  on('session.cwd', () => ({ value: ROOT }))
+  on('session.cwd', () => ({ value: seen.cwd }))
   on('ui.log', () => ({ value: undefined }))
   on('command.register', ($, e) => {
     seen.commands.push(e.name)
@@ -55,12 +68,15 @@ function world(on: On, opts: { files?: Record<string, File>; write?: (path: stri
     const size = target?.bytes?.length ?? enc.encode(target?.text ?? '').length
     return { value: { kind: 'file', size, mtimeMs: 0, isLink: f.link !== undefined, ...(e.resolve ? { realPath: f.link ? abs(f.link) : p } : {}) } }
   })
-  on('fs.read', ($, e) => {
+  on('fs.read', async ($, e) => {
+    const n = (reads.get(abs(e.path)) ?? 0) + 1
+    reads.set(abs(e.path), n)
+    await opts.onRead?.($, abs(e.path), n)
     const f = files.get(abs(e.path))
     if (!f) return { deny: 'ENOENT' }
     return { value: { base64: f.bytes ? b64(f.bytes) : b64(f.text ?? '') } }
   })
-  on('process.run', ($, e) => {
+  on('process.run', async ($, e) => {
     const argv = e.argv
     seen.runs.push([...argv])
     if (opts.noBinary) return { deny: 'spawn ENOENT' }
@@ -68,6 +84,7 @@ function world(on: On, opts: { files?: Record<string, File>; write?: (path: stri
     const rule = JSON.parse(argv[argv.indexOf('--inline-rules') + 1]!) as { language: string; rule: { pattern: string }; fix?: string }
     const stdin = argv.includes('--stdin') ? e.init?.stdin : undefined
     const paths = argv.includes('--') ? argv.slice(argv.indexOf('--') + 1) : []
+    if (stdin !== undefined) await opts.onStdinScan?.($)
     // A recorded stdin run over the same text answers a stdin run over any file.
     const c = CORPUS.find(x =>
       x.language === rule.language && x.pattern === rule.rule.pattern && x.fix === rule.fix &&
@@ -77,8 +94,12 @@ function world(on: On, opts: { files?: Record<string, File>; write?: (path: stri
     if (stdin === undefined && paths[0] === 'n.ts') return { value: { ...nested.result, stdout: nested.result.stdout.replaceAll('"STDIN"', '"n.ts"') } }
     throw new Error(`no corpus case for ${JSON.stringify({ rule, paths, stdin })}`)
   })
-  on('tool.check', ($, e) => ({ decision: opts.check?.((e.input as { file_path: string }).file_path) ?? 'allow' }))
-  on('tool.call', ($, e) => {
+  on('tool.check', async ($, e) => {
+    const path = (e.input as { file_path: string }).file_path
+    await opts.onCheck?.($, path)
+    return { decision: opts.check?.(path) ?? 'allow' }
+  })
+  on('tool.call', async ($, e) => {
     if (e.tool !== 'Write') throw new Error(`unexpected tool ${e.tool}`)
     const mode = opts.write?.(e.file_path) ?? 'ok'
     if (mode === 'deny') return { deny: `Permission to write ${e.file_path} was denied.` }
@@ -86,6 +107,7 @@ function world(on: On, opts: { files?: Record<string, File>; write?: (path: stri
     seen.writes.push({ path: e.file_path, content: e.content })
     const content = typeof mode === 'object' ? mode.modified : e.content
     if (mode !== 'staged') files.set(e.file_path, { text: content })
+    await opts.afterWrite?.($, e.file_path)
     return {
       result: {
         type: 'update' as const, filePath: e.file_path, content, structuredPatch: [], originalFile: null,
@@ -377,5 +399,36 @@ describe('preview refusals', () => {
     world(on, { files: { 'src/a.ts': { text: 'const a = foo(1)\nfoo(2)\n' + 'x'.repeat(256 * 1024) } } })
     await start($)
     expect(err(await call($, 'preview', { ...FOO, paths: ['src'] })).code).toBe('TOO_LARGE')
+  })
+})
+
+describe('write authority', () => {
+  test('/clear during the final read before a write: that file is not written', async ($, on) => {
+    let seen: ReturnType<typeof world>
+    seen = world(on, {
+      // reads of a.ts: preview snapshot, preview recheck, apply preflight, then the read right before its write
+      onRead: async (_, path, n) => {
+        if (path === '/w/src/a.ts' && n === 4) {
+          await $.session.end({ reason: 'clear', sessionId: 's1', resume: { id: 's1' } })
+          seen.sessionId = 's2'
+        }
+      },
+    })
+    await start($)
+    const p = ok(await call($, 'preview', { ...FOO, paths: ['src'] }))
+    const e = err(await call($, 'apply', { previewId: p.previewId }))
+    expect(e.files[0]).toMatchObject({ path: 'src/a.ts', status: 'not-written' })
+    expect(seen.writes).toEqual([])
+    expect(text(seen, 'src/a.ts')).toBe('const a = foo(1)\nfoo(2)\n')
+  })
+
+  test('a change of the session directory after the preflight: nothing is written', async ($, on) => {
+    let seen: ReturnType<typeof world>
+    seen = world(on, { onCheck: () => { seen.cwd = '/w2' } })
+    await start($)
+    const p = ok(await call($, 'preview', { ...FOO, paths: ['src'] }))
+    const e = err(await call($, 'apply', { previewId: p.previewId }))
+    expect(e.files.map((f: any) => f.status)).toEqual(['not-written', 'unstarted'])
+    expect(seen.writes).toEqual([])
   })
 })

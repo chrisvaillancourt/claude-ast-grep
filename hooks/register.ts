@@ -263,26 +263,66 @@ async function preview($: EngineInterface, e: Record<string, unknown> & { agentI
     const again = await snapshot($, f.abs)
     if (again?.hash !== f.beforeHash) throw new Refusal('STALE', `${f.path} changed while previewing. Preview again.`)
   }
-  const now = await whereNow($)
-  if (now.sessionId !== where.sessionId || now.root !== where.root) throw new Refusal('SESSION_CHANGED', 'The conversation changed while previewing; nothing was kept.')
-
   const at = (await $.clock.now())
   const p: Preview = {
     id: newId('ag'), sessionId: where.sessionId, root: where.root, createdAt: at, expiresAt: at + PREVIEW_TTL_MS,
     pattern: q.value.pattern, rewrite: q.value.rewrite, language: q.value.language, replacements, files, state: 'pending', runId: null,
   }
-  let taken: Preview | null = null
-  await update($, sessionAtom, cur => {
-    const held = cur.preview
-    taken = held && (held.state === 'applying' || at < held.expiresAt) ? held : null
-    return taken ? cur : { ...cur, preview: p }
-  })
-  const held = taken as Preview | null
-  if (held) throw new Refusal('PREVIEW_PENDING', `Preview ${held.id} became pending meanwhile; apply or discard it first.`)
+  const denied = await authorize($, where, { kind: 'publish', preview: p })
+  if (denied) throw new Refusal(denied.code, denied.code === 'PREVIEW_PENDING' ? denied.message : `No preview was kept: ${denied.message}.`)
   log($, `preview ${p.id}: ${replacements} replacements in ${files.length} files`)
   const out = JSON.parse(previewText(p, diff)) as Record<string, unknown>
   if (unchanged.length > 0) out.unchanged = unchanged
   return JSON.stringify(out)
+}
+
+/** The facts an operation started from; it may act only while they still hold. */
+type Op = { sessionId: string; root: string }
+
+/** What an operation asks to do: publish its preview, or issue the Write of file `index` of a run. */
+type Act = { kind: 'publish'; preview: Preview } | { kind: 'write'; id: string; runId: string; index: number }
+
+type Denial = { code: ErrorCode; message: string }
+
+/** Whether `act` may happen in state `s`, or why not. Pure: the one rule for write authority. */
+function decide(s: Session, act: Act, now: number): Denial | null {
+  if (act.kind === 'publish') {
+    const held = s.preview
+    if (held && (held.state === 'applying' || now < held.expiresAt)) {
+      return { code: 'PREVIEW_PENDING', message: `Preview ${held.id} became pending meanwhile; apply or discard it first.` }
+    }
+    return null
+  }
+  const p = s.preview
+  if (!p || p.id !== act.id || p.state !== 'applying' || p.runId !== act.runId) {
+    return { code: 'SESSION_CHANGED', message: 'the apply lost its preview (cleared, discarded or the conversation changed) before this write' }
+  }
+  return null
+}
+
+function transition(s: Session, act: Act): Session {
+  if (act.kind === 'publish') return { ...s, preview: act.preview }
+  const p = s.preview!
+  return { ...s, preview: { ...p, files: p.files.map((f, k) => (k === act.index ? { ...f, status: 'writing' as const } : f)) } }
+}
+
+/**
+ * The single authorization step before a side effect: the session and its
+ * directory are still the ones `op` started in, then one versioned update
+ * decides and, when allowed, applies the act (publish, or mark the file
+ * `writing`). Nothing may be awaited between an allowed write and its Write call.
+ */
+async function authorize($: EngineInterface, op: Op, act: Act): Promise<Denial | null> {
+  const now = await whereNow($).catch(() => null)
+  if (!now || now.sessionId !== op.sessionId) return { code: 'SESSION_CHANGED', message: 'the conversation changed (a /clear?) before this step' }
+  if (now.root !== op.root) return { code: 'SESSION_CHANGED', message: `the session directory changed (${op.root} -> ${now.root}) before this step` }
+  const at = await $.clock.now()
+  let denial: Denial | null = null
+  await update($, sessionAtom, s => {
+    denial = decide(s, act, at)
+    return denial ? s : transition(s, act)
+  })
+  return denial
 }
 
 async function setFile($: EngineInterface, id: string, runId: string, i: number, status: FileStatus, note?: string) {
@@ -349,20 +389,19 @@ async function apply($: EngineInterface, e: Record<string, unknown> & { agentId?
     let written = 0
     for (let i = 0; i < files.length; i++) {
       const f = files[i]!
-      const s = await read($, sessionAtom)
-      const now = await whereNow($)
-      if (s.preview?.runId !== runId || now.sessionId !== p.sessionId) {
-        f.status = 'not-written'
-        f.note = 'the apply lost its preview (cleared or the conversation changed) before this write'
-        break
-      }
       const before = await snapshot($, f.abs)
       if (before?.hash !== f.beforeHash) {
         f.status = 'not-written'
         f.note = 'changed after the preview, right before its write'
         break
       }
-      await setFile($, id, runId, i, 'writing')
+      // The last step before the Write: nothing is awaited between it and the call.
+      const denied = await authorize($, { sessionId: p.sessionId, root: p.root }, { kind: 'write', id, runId, index: i })
+      if (denied) {
+        f.status = 'not-written'
+        f.note = denied.message
+        break
+      }
       let kind: WriteOutcome = 'ok'
       const extra: { staged?: boolean; userModified?: boolean; reason?: string } = {}
       try {
