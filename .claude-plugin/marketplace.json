@@ -1,0 +1,13 @@
+{
+  "name": "ast-grep",
+  "owner": {
+    "name": "Chris Vaillancourt"
+  },
+  "plugins": [
+    {
+      "name": "ast-grep",
+      "source": "./"
+    }
+  ],
+  "description": "Structural code search and previewed, staged rewrites through the ast-grep CLI."
+}
