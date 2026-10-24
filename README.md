@@ -1,24 +1,111 @@
 # ast-grep
 
-A Claude Code mod (function-hook plugin). Replace this paragraph with what the mod does and why, in two or three sentences.
+A Claude Code mod that gives the model structural code search and previewed rewrites through the [ast-grep](https://ast-grep.github.io/) CLI. The model searches with a syntax pattern (`console.log($A)`), previews a rewrite as a complete diff, and then applies exactly that diff, or discards it. Apply writes the content the preview showed, never a fresh rewrite, and refuses to write anything when a target changed after the preview.
 
-> This repository is also the template for new mods: `scripts/new-mod.sh <mod-name>` creates `../claude-<mod-name>` with every `ast-grep` renamed, a fresh git history and one commit. Delete this note in the new repo.
+Each file is written through Claude Code's own Write tool, so your permission rules, permission prompts, the auto-mode classifier and your settings hooks judge every write the way they judge the model's own edits.
 
 ## Behavior
 
-- What the mod does, when, and to which conversations (main only, or subagents too).
-- What it costs (model calls, tokens) and how the options bound it.
-- What it never does.
+- **`mcp__ast-grep__search`** `{ pattern, language, paths?, globs?, maxResults? }`: matches of one pattern in one language under the session's directory. Each match has its file, 1-based line and column, matched text, the source lines it spans, and the captured metavariables. Read-only.
+- **`mcp__ast-grep__preview`** `{ pattern, rewrite, language, paths, globs? }`: computes a rewrite without touching any file and returns a preview id, its expiry, the files and replacement counts, and the complete unified diff. `rewrite` may be empty (deletes each match).
+- **`mcp__ast-grep__apply`** `{ previewId }`: writes the preview. Before the first write it re-reads every target and compares its SHA-256 with the hash taken at preview time; if any file differs, nothing is written and the preview is dropped. Then each file is written with the built-in Write tool, re-read and hashed again. The result lists every file as `written`, `refused`, `failed`, `not-written` or `differs`, and says to Read a file before editing it.
+- **`mcp__ast-grep__discard`** `{ previewId }`: drops a pending preview.
+- One preview may be pending at a time; a second preview is refused until the first is applied or discarded. A preview expires after 15 minutes, and `/clear`, `/ast-grep off` and `/ast-grep discard` drop it.
+- The tools serve the main conversation only. A subagent's call is refused with an error.
+- Every failure is an explicit error the model reads, with a code (`INVALID_RULE`, `CLI_ERROR`, `STALE`, `OVERLAP`, `TOO_LARGE`, ...). An invalid pattern, a missing path or an unsupported language is never reported as "no matches".
+
+### How a rewrite is computed
+
+1. `ast-grep scan` runs over the paths with a rule the mod writes itself (`--inline-rules` with one pattern, the language and the rewrite as `fix`) and a config file the mod ships (`assets/sgconfig.yml`), so a repository's own `sgconfig.yml`, rule files and custom languages never change the operation. Arguments go to the CLI as an argument vector, never through a shell. The mod uses `scan`, not `run`: `run` exits 0 with no matches on an invalid pattern.
+2. Each matching file is checked (a regular file, no symbolic link on its path, inside the session's directory, at most 256 KiB, valid UTF-8 with no NUL byte) and read once. ast-grep then runs again on that snapshot through stdin, so the replacements belong to exactly the bytes that were read.
+3. The replacements are applied by UTF-8 byte offset, from the end of the file to the start. Overlapping replacements (a rewrite of `foo($A)` over `foo(foo(1))`) are refused: no preview id. Untouched bytes stay as they were, line endings and a missing final newline included.
+4. The diff is computed from the stored before and after text. It is exact (applying it gives the stored after text) but not always minimal: unchanged lines between two nearby replacements can show as removed and added.
+
+### Apply and permissions
+
+Apply calls the built-in Write tool once per file, as the plugin's own tool call. That call goes through the same permission path as the model's Write: allow and deny rules, the permission mode, the prompt in an interactive session, the auto-mode classifier, and `PreToolUse` hooks. Before any write the mod also asks the permission check (`$.tool.check`) about every file and refuses the whole apply when one would be denied.
+
+- A refused write (a deny rule, a declined prompt, a headless session in the default mode) stops the apply at that file. Files before it stay written, and the result says which.
+- A write the person edited in the prompt, or one held for review instead of written (`staged`), is reported as `differs` or `not-written` after the file is re-read: never as written.
+- In a headless session (`claude -p`) in the default permission mode the first write is refused and nothing is written. `--permission-mode acceptEdits`, or a `Write` allow rule, lets apply write.
+
+The writes are sequential, not a transaction. Every target is checked before the first write and again right before its own write, which narrows the window for a concurrent change but does not close it: another program writing a target between that check and the write is not detected until the re-read afterwards. A failure part way through leaves the earlier files written; the mod does not roll them back.
+
+### What it costs
+
+No model calls. Each tool call runs the local ast-grep CLI: one process for a search, and for a preview one discovery scan plus one per changed file (at most 21). The results are ordinary tool-result tokens: a search result is at most 32 KiB of JSON, a preview at most a 64 KiB diff plus its summary.
+
+The four tools are registered once when the session starts and stay the same for the whole session. They are deferred behind ToolSearch by default, so each request carries only their names until the model loads them. Set `alwaysLoaded` to put their schemas in every request instead (about 1,500 tokens more per request).
+
+### What it never does
+
+- Write a file with its own file access: every write is a Write tool call.
+- Re-run the rewrite at apply time, or include files or matches that appeared after the preview.
+- Follow symbolic links, read outside the session's directory, or touch binary or non-UTF-8 files.
+- Truncate a preview diff: a rewrite whose diff or snapshots exceed the bounds gets no preview id.
+
+## Contract
+
+In scope: regular UTF-8 source files under the session's working directory; the languages built into the installed ast-grep; one pattern and one rewrite per call, in one language; ast-grep's own file selection (its ignore files, `--globs`, hidden files skipped); a file set frozen at preview time; writing exactly the stored content when every target is unchanged.
+
+Out of contract:
+
+- YAML rules, rule files, `constraints`, `transform`, relational rules (`inside`, `has`), several rewrites in one call, mixed languages in one call.
+- A repository's `sgconfig.yml`, custom languages and `utils`: ignored on purpose.
+- Files outside the session's directory, symbolic links, hard-link aliases, binary or invalid UTF-8 files, files over 256 KiB.
+- Semantic or type-aware refactoring; a guarantee that the rewritten code parses.
+- File metadata (mode, timestamps) beyond what the Write tool keeps.
+- An atomic multi-file write, rollback, crash recovery, or protection against a program writing the same files while apply runs.
+- Context lines around search matches (ast-grep's JSON output has none; each match carries its own source lines).
 
 ## Command
 
-`/ast-grep [on|off|status]`: show or set whether the mod is on for this session.
+`/ast-grep [status|on|off|discard]`
+
+- `status` (the default): on or off and why, the ast-grep version found, the pending preview (id, files, time left) and the last apply's outcome.
+- `on` / `off`: turn the tools on or off for this session. Off, every call is refused with a message saying so and a pending preview is dropped. The tools stay registered either way, so the tool list doesn't change mid-session.
+- `discard`: drop the pending preview, or clear the record of an apply a reload interrupted.
 
 ## Options
 
 | Option | Default | What it does |
 | --- | --- | --- |
-| `enabled` | `true` | Turn the mod on for new sessions. `/ast-grep on|off` overrides it per session. |
+| `enabled` | `true` | Turn the tools on for new sessions. `/ast-grep on|off` overrides it per session. |
+| `alwaysLoaded` | `false` | Put the four tools' schemas in every request instead of behind ToolSearch. |
+| `binary` | `ast-grep` | The ast-grep executable, a name on `PATH` or an absolute path. (`sg` is a deprecated alias that warns on stderr, which the mod treats as an error.) |
+| `timeoutSeconds` | `30` | Time limit for each ast-grep process (5 to 300). |
+
+Fixed bounds:
+
+| Bound | Value |
+| --- | --- |
+| Pattern, rewrite | 16 KiB each |
+| Paths, globs | 16 each |
+| Search matches | 50 by default, `maxResults` up to 200; more is reported as `truncated` |
+| Search result | 32 KiB of JSON; matches past it are dropped and the result says `truncated` |
+| Matched text and source lines in a search result | 400 characters each, marked when cut |
+| Replacements in one preview | 1,000 |
+| Changed files in one preview | 20 |
+| One changed file | 256 KiB |
+| Stored before and after text, all files together | 1 MiB |
+| Preview diff | 64 KiB |
+| ast-grep output | 1 MiB of stdout; any stderr output fails the call |
+
+## Requirements
+
+ast-grep 0.51.0 or newer on `PATH` (`brew install ast-grep`, `cargo install ast-grep`, or `npm i -g @ast-grep/cli`). It was built and checked against 0.51.0. The mod checks the shape of every JSON field it reads, so an incompatible output format fails with `CLI_OUTPUT` rather than producing a wrong rewrite.
+
+## Limitations
+
+- One pattern per call; no YAML rules, constraints or transforms (cut for the first version).
+- No context lines around search matches.
+- No pagination: a search returns at most 200 matches; narrow the paths or globs for more.
+- The diff is exact but not minimal for nearby replacements.
+- A partial apply is not rolled back. Claude Code's own file history (rewind) may hold the earlier content; the mod keeps no copy of its own once the apply ends.
+- A reload during an apply leaves an `interrupted` record listing what was known about each file; the mod never resumes it. `/ast-grep discard` clears it.
+- Tools are refused in subagents.
+- The apply-then-Edit behavior (whether the built-in Edit accepts a file the mod wrote without a fresh Read) depends on the engine; the result tells the model to Read first either way.
+- Checked live on Claude Code 2.1.310 in headless sessions only; the interactive permission prompt for apply has not been checked live yet.
 
 ## Install
 
@@ -44,9 +131,10 @@ Then restart Claude Code.
 
 ```sh
 scripts/check.sh
+scripts/capture-corpus.sh   # re-record the ast-grep outputs the tests replay
 ```
 
-It runs `claude plugin validate .`, `claude plugin test .` and a TypeScript check. Commit messages follow [Conventional Commits](https://www.conventionalcommits.org/).
+`check.sh` runs `claude plugin validate .`, `claude plugin test .` and a TypeScript check. The CLI tests replay real ast-grep 0.51.0 outputs recorded in `hooks/corpus.ts`. Commit messages follow [Conventional Commits](https://www.conventionalcommits.org/).
 
 ## License
 
