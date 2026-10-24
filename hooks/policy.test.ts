@@ -136,6 +136,18 @@ describe('formatSearch', () => {
     })
   })
 
+  test('the whole envelope stays within 32 KiB: rows, notes and the skipped list (151 visible, 50 hidden)', async () => {
+    const rows = Array.from({ length: 151 }, (_, i) => ({ ...match(i, 'y'.repeat(180)), multi: { ARGS: Array.from({ length: 60 }, (_, k) => `a${k}`) } }))
+    const hidden = Array.from({ length: 50 }, (_, i) => `deep/${'h'.repeat(200)}/.hidden-${i}.ts`)
+    const text = formatSearch(rows, 200, hidden)
+    expect(new TextEncoder().encode(text).length).toBeLessThanOrEqual(MAX_SEARCH_JSON)
+    const out = JSON.parse(text)
+    expect(out.truncated).toBe(true)
+    expect(out.skippedHiddenCount).toBe(50)
+    expect(out.capturesTruncated).toBe(true)
+    expect(out.count).toBe(out.matches.length)
+  })
+
   test('a $$$ capture over 50 nodes is cut and marked with its full count', async () => {
     const nodes = Array.from({ length: 60 }, (_, i) => `a${i}`)
     const out = JSON.parse(formatSearch([{ ...match(0), multi: { ARGS: nodes } }], 50))

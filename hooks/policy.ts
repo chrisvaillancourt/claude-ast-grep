@@ -83,14 +83,39 @@ export function clip(s: string, n: number): string {
   return s.length <= n ? s : `${s.slice(0, n)}… (${s.length - n} more characters)`
 }
 
-/** Search matches as the tool's JSON, at most `max`, within MAX_SEARCH_JSON bytes. */
+const SKIPPED_LIST_BYTES = 4 * KIB
+
+/**
+ * Search matches as the tool's JSON, at most `max`, the whole envelope within
+ * MAX_SEARCH_JSON bytes: the skipped list (bounded, its full count kept) and the
+ * longest possible notes are reserved before any row is admitted.
+ */
 export function formatSearch(matches: readonly CliMatch[], max: number, skippedHidden: readonly string[] = []): string {
+  const enc = new TextEncoder()
+  const size = (v: unknown) => enc.encode(JSON.stringify(v)).length
+  // The skipped list: as many names (each clipped) as fit in its own budget.
+  const shown: string[] = []
+  let listBytes = 2
+  for (const name of skippedHidden.slice(0, 50)) {
+    const n = size(clip(name, MAX_FIELD)) + 1
+    if (listBytes + n > SKIPPED_LIST_BYTES) break
+    listBytes += n
+    shown.push(clip(name, MAX_FIELD))
+  }
+  const notes = {
+    count: `More than ${max} matches; narrow paths or globs, or raise maxResults (at most ${MAX_RESULTS}).`,
+    budget: `Result cut at ${MAX_SEARCH_JSON / KIB} KiB after 9999 matches; narrow paths or globs.`,
+    captures: `Some $$$ captures were cut to ${MAX_MULTI_NODES} nodes; multiTruncated gives each one's full count.`,
+    hidden: 'ast-grep returned hidden files that were dropped; other matches may be missing.',
+  }
+  const reserve = size({
+    status: 'ok', matches: [], count: 9999, truncated: true, note: Object.values(notes).join(' '), capturesTruncated: true,
+    ...(skippedHidden.length > 0 ? { skippedHidden: shown, skippedHiddenCount: skippedHidden.length } : {}),
+  })
   const rows: Record<string, unknown>[] = []
   let truncated = matches.length > max
-  let note = truncated ? `More than ${max} matches; narrow paths or globs, or raise maxResults (at most ${MAX_RESULTS}).` : ''
-  const enc = new TextEncoder()
-  const shell = (n: number, why: string) => JSON.stringify({ status: 'ok', matches: [], count: n, truncated: true, note: why })
-  let used = enc.encode(shell(9999, note || 'x'.repeat(120))).length
+  let cutAtBudget = false
+  let used = reserve
   for (const m of matches.slice(0, max)) {
     const row: Record<string, unknown> = { file: m.file, line: m.line, column: m.column, text: clip(m.text, MAX_FIELD), lines: clip(m.lines, MAX_FIELD) }
     if (Object.keys(m.captures).length > 0) {
@@ -101,27 +126,31 @@ export function formatSearch(matches: readonly CliMatch[], max: number, skippedH
       const cut = Object.entries(m.multi).filter(([, v]) => v.length > MAX_MULTI_NODES)
       if (cut.length > 0) row.multiTruncated = Object.fromEntries(cut.map(([k, v]) => [k, v.length]))
     }
-    const size = enc.encode(JSON.stringify(row)).length + 1
-    if (used + size > MAX_SEARCH_JSON) {
-      truncated = true
-      note = `Result cut at ${MAX_SEARCH_JSON / KIB} KiB after ${rows.length} matches; narrow paths or globs.`
+    const n = size(row) + 1
+    if (used + n > MAX_SEARCH_JSON) {
+      cutAtBudget = true
       break
     }
-    used += size
+    used += n
     rows.push(row)
   }
-  if (!truncated) note = rows.length === 0 ? 'No matches.' : ''
-  const out: Record<string, unknown> = { status: 'ok', matches: rows, count: rows.length, truncated }
-  if (rows.some(r => r.multiTruncated !== undefined)) {
-    out.capturesTruncated = true
-    note = `${note ? `${note} ` : ''}Some $$$ captures were cut to ${MAX_MULTI_NODES} nodes; multiTruncated gives each one's full count.`
-  }
-  if (note) out.note = note
+  const parts: string[] = []
+  if (cutAtBudget) {
+    truncated = true
+    parts.push(notes.budget.replace('9999', String(rows.length)))
+  } else if (truncated) parts.push(notes.count)
+  const captures = rows.some(r => r.multiTruncated !== undefined)
+  if (captures) parts.push(notes.captures)
   if (skippedHidden.length > 0) {
-    // ast-grep excludes hidden paths itself; one it returned anyway was dropped here, after its cap.
-    out.truncated = true
-    out.note = `${out.note ? `${out.note} ` : ''}ast-grep returned hidden files that were dropped; other matches may be missing.`
-    out.skippedHidden = skippedHidden.slice(0, 50)
+    truncated = true
+    parts.push(notes.hidden)
+  }
+  if (rows.length === 0 && !truncated) parts.push('No matches.')
+  const out: Record<string, unknown> = { status: 'ok', matches: rows, count: rows.length, truncated }
+  if (parts.length > 0) out.note = parts.join(' ')
+  if (captures) out.capturesTruncated = true
+  if (skippedHidden.length > 0) {
+    out.skippedHidden = shown
     out.skippedHiddenCount = skippedHidden.length
   }
   return JSON.stringify(out)

@@ -83,7 +83,7 @@ Fixed bounds:
 | Pattern, rewrite | 16 KiB each |
 | Paths, globs | 16 each |
 | Search matches | 50 by default, `maxResults` up to 200; more is reported as `truncated` |
-| Search result | 32 KiB of JSON; matches past it are dropped and the result says `truncated` |
+| Search result | 32 KiB of JSON for the whole result (rows, notes and lists); matches past it are dropped and the result says `truncated` |
 | Matched text, source lines and captures in a search result | 400 characters each, marked when cut; at most 50 nodes per `$$$` capture, with `multiTruncated` giving the full count and `capturesTruncated: true` on the result |
 | Replacements in one preview | 1,000 |
 | Changed files in one preview | 20 |
