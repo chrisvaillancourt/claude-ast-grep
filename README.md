@@ -10,6 +10,7 @@ Each file is written through Claude Code's own Write tool, so your permission ru
 - **`mcp__ast-grep__preview`** `{ pattern, rewrite, language, paths, globs? }`: computes a rewrite without touching any file and returns a preview id, its expiry, the files and replacement counts, and the complete unified diff. `rewrite` may be empty (deletes each match).
 - **`mcp__ast-grep__apply`** `{ previewId }`: writes the preview. Before the first write it re-reads every target and compares its SHA-256 with the hash taken at preview time; if any file differs, nothing is written and the preview is dropped. Then each file is written with the built-in Write tool, re-read and hashed again. The result lists every file as `written`, `refused`, `failed`, `not-written`, `differs`, `unknown` or `unstarted` (never reached), and says to Read a file before editing it. Anything short of every file `written` comes back as an error result.
 - **`mcp__ast-grep__discard`** `{ previewId }`: drops a pending preview.
+- **Hidden paths are skipped:** a file whose path has a segment starting with a dot (`.env.ts`, `.cache/x.ts`) is left out of search and preview results unless a path you named is itself hidden (`paths: [".cache"]`). ast-grep 0.51.0 skips hidden directories but still reports a hidden file at the top of a scanned directory, so the mod applies the rule itself. Results list what was left out as `skippedHidden` (the first 50) with `skippedHiddenCount`.
 - One preview may be pending at a time; a second preview is refused until the first is applied or discarded. A preview expires after 15 minutes, and `/clear`, `/ast-grep off` and `/ast-grep discard` drop it.
 - The tools serve the main conversation only. A subagent's call is refused with an error.
 - Every failure is an explicit error the model reads, with a code (`INVALID_RULE`, `CLI_ERROR`, `STALE`, `OVERLAP`, `TOO_LARGE`, ...). An invalid pattern, a missing path or an unsupported language is never reported as "no matches".
@@ -46,7 +47,7 @@ The four tools are registered once when the session starts and stay the same for
 
 ## Contract
 
-In scope: regular UTF-8 source files under the session's working directory; the languages built into the installed ast-grep; one pattern and one rewrite per call, in one language; ast-grep's own file selection (its ignore files, `--globs`, hidden files skipped); a file set frozen at preview time; writing exactly the stored content when every target is unchanged.
+In scope: regular UTF-8 source files under the session's working directory; the languages built into the installed ast-grep; one pattern and one rewrite per call, in one language; ast-grep's own file selection (its ignore files and `--globs`), with hidden paths skipped by the mod; a file set frozen at preview time; writing exactly the stored content when every target is unchanged.
 
 Out of contract:
 

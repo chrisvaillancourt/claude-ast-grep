@@ -44,11 +44,18 @@ describe('corpus', () => {
     expect(parseScan(run('search-basic').result, { rewrite: false })).toEqual({
       ok: true,
       matches: [
+        // ast-grep 0.51.0 reports a hidden file at the top of a scanned directory; the mod filters it (policy.ts)
+        m({ file: '.hidden.ts', start: 0, end: 6, text: 'foo(5)', captures: { A: '5' } }),
         m({ file: 'src/a.ts', start: 10, end: 16, column: 11, text: 'foo(1)', lines: 'const a = foo(1)', captures: { A: '1' } }),
         m({ file: 'src/a.ts', start: 17, end: 23, line: 2, text: 'foo(2)', captures: { A: '2' } }),
         m({ file: 'src/d.ts', start: 0, end: 6, text: 'foo(4)', captures: { A: '4' } }),
       ],
     })
+  })
+
+  test('a hidden directory named as the path is scanned', async () => {
+    const r = parseScan(run('search-hidden-dir').result, { rewrite: false })
+    expect(r.ok && r.matches.map(x => x.file)).toEqual(['src/.cache/e.ts'])
   })
 
   test('multi captures keep every node, separators included', async () => {

@@ -7,6 +7,7 @@ import {
   formatSearch,
   isActive,
   parseArgs,
+  isSkippedHidden,
   relativeTo,
   statusText,
   validatePreview,
@@ -92,6 +93,17 @@ describe('tool input', () => {
     expect(validatePreviewId({ previewId: 'ag-1a2b' })).toEqual({ ok: true, value: 'ag-1a2b' })
     const r = validatePreviewId({ previewId: '../x' })
     expect(r.ok ? 'ok' : r.error).toBe('previewId must be the id a preview returned')
+  })
+})
+
+describe('hidden paths', () => {
+  test('a path with a segment starting with a dot is hidden, unless a named scope already is', async () => {
+    expect(isSkippedHidden('.hidden.ts', ['.'])).toBe(true)
+    expect(isSkippedHidden('src/.cache/e.ts', ['src'])).toBe(true)
+    expect(isSkippedHidden('src/a.ts', ['.'])).toBe(false)
+    expect(isSkippedHidden('src/.cache/e.ts', ['src/.cache'])).toBe(false)
+    expect(isSkippedHidden('.hidden.ts', ['.hidden.ts'])).toBe(false)
+    expect(isSkippedHidden('src/.cache/e.ts', ['src/.cache/e.ts', 'src'])).toBe(false)
   })
 })
 

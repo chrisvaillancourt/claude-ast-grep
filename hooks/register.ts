@@ -18,6 +18,7 @@ import {
   errorText,
   formatSearch,
   isActive,
+  isSkippedHidden,
   parseArgs,
   previewText,
   relativeTo,
@@ -202,8 +203,10 @@ async function search($: EngineInterface, e: Record<string, unknown> & { agentId
   await ensureCli($)
   const paths = await scopePaths($, where.root, q.value.paths)
   const rule = ruleText({ pattern: q.value.pattern, language: q.value.language })
-  const matches = await scan($, where.root, rule, q.value.maxResults + 1, { paths, globs: q.value.globs })
-  return formatSearch(matches, q.value.maxResults)
+  const raw = await scan($, where.root, rule, q.value.maxResults + 1, { paths, globs: q.value.globs })
+  const matches = raw.filter(m => !isSkippedHidden(m.file, paths))
+  const skipped = [...new Set(raw.filter(m => isSkippedHidden(m.file, paths)).map(m => m.file))]
+  return formatSearch(matches, q.value.maxResults, skipped)
 }
 
 async function preview($: EngineInterface, e: Record<string, unknown> & { agentId?: string }): Promise<string> {
@@ -221,8 +224,13 @@ async function preview($: EngineInterface, e: Record<string, unknown> & { agentI
 
   const found = await scan($, where.root, rule, MAX_REPLACEMENTS + 1, { paths, globs: q.value.globs })
   if (found.length > MAX_REPLACEMENTS) throw new Refusal('TOO_LARGE', `More than ${MAX_REPLACEMENTS} replacements; narrow paths or globs.`)
-  const names = [...new Set(found.map(m => m.file))].sort()
-  if (names.length === 0) return JSON.stringify({ status: 'no-matches', previewId: null, note: 'Nothing matched: no preview was made and no file changes.' })
+  const all = [...new Set(found.map(m => m.file))].sort()
+  // Hidden files are out of the default scope (README), and the result names any left out.
+  const names = all.filter(f => !isSkippedHidden(f, paths))
+  const skippedHidden = all.filter(f => isSkippedHidden(f, paths))
+  if (names.length === 0) {
+    return JSON.stringify({ status: 'no-matches', previewId: null, note: 'Nothing matched: no preview was made and no file changes.', ...(skippedHidden.length > 0 ? { skippedHidden: skippedHidden.slice(0, 50), skippedHiddenCount: skippedHidden.length } : {}) })
+  }
   if (names.length > MAX_FILES) throw new Refusal('TOO_LARGE', `The rewrite touches ${names.length} files; a preview holds at most ${MAX_FILES}. Narrow paths or globs.`)
 
   const files: PreviewFile[] = []
@@ -273,6 +281,10 @@ async function preview($: EngineInterface, e: Record<string, unknown> & { agentI
   log($, `preview ${p.id}: ${replacements} replacements in ${files.length} files`)
   const out = JSON.parse(previewText(p, diff)) as Record<string, unknown>
   if (unchanged.length > 0) out.unchanged = unchanged
+  if (skippedHidden.length > 0) {
+    out.skippedHidden = skippedHidden.slice(0, 50)
+    out.skippedHiddenCount = skippedHidden.length
+  }
   return JSON.stringify(out)
 }
 

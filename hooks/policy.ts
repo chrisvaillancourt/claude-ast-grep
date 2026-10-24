@@ -83,7 +83,7 @@ export function clip(s: string, n: number): string {
 }
 
 /** Search matches as the tool's JSON, at most `max`, within MAX_SEARCH_JSON bytes. */
-export function formatSearch(matches: readonly CliMatch[], max: number): string {
+export function formatSearch(matches: readonly CliMatch[], max: number, skippedHidden: readonly string[] = []): string {
   const rows: Record<string, unknown>[] = []
   let truncated = matches.length > max
   let note = truncated ? `More than ${max} matches; narrow paths or globs, or raise maxResults (at most ${MAX_RESULTS}).` : ''
@@ -110,6 +110,10 @@ export function formatSearch(matches: readonly CliMatch[], max: number): string 
   if (!truncated) note = rows.length === 0 ? 'No matches.' : ''
   const out: Record<string, unknown> = { status: 'ok', matches: rows, count: rows.length, truncated }
   if (note) out.note = note
+  if (skippedHidden.length > 0) {
+    out.skippedHidden = skippedHidden.slice(0, 50)
+    out.skippedHiddenCount = skippedHidden.length
+  }
   return JSON.stringify(out)
 }
 
@@ -190,6 +194,21 @@ export function validatePreviewId(e: Record<string, unknown>): Checked<string> {
   const id = e.previewId
   if (typeof id !== 'string' || !PREVIEW_ID.test(id)) return { ok: false, error: 'previewId must be the id a preview returned' }
   return { ok: true, value: id }
+}
+
+const isHiddenSegment = (seg: string) => seg.startsWith('.') && seg !== '.' && seg !== '..'
+
+/**
+ * Whether a matched file (relative to the root) is skipped as hidden: some
+ * segment starts with a dot, and the file is not inside a hidden path the
+ * caller named explicitly. ast-grep 0.51.0 skips hidden directories while walking but
+ * still reports a hidden file at the top of a scanned directory, so the mod
+ * applies the rule itself.
+ */
+export function isSkippedHidden(file: string, scopes: readonly string[]): boolean {
+  if (!file.split('/').some(isHiddenSegment)) return false
+  const named = scopes.some(sc => sc !== '.' && sc.split('/').some(isHiddenSegment) && (file === sc || file.startsWith(`${sc}/`)))
+  return !named
 }
 
 /** `real` relative to `root` (both resolved, `/`-separated), `.` for the root itself, or null when outside. */

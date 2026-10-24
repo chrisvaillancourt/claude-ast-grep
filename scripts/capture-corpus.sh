@@ -24,6 +24,11 @@ printf 'const a = foo(1)\nfoo(2)\n' >"$proj/src/a.ts"
 printf '// \xc3\xbcn\xc3\xafc\xc3\xb6d\xc3\xa9\nconst b = foo(x, y)\n' >"$proj/src/b.ts"
 printf 'foo(3)\n' >"$proj/src/c.js"
 printf 'foo(4)\n' >"$proj/src/d.ts"
+# Hidden paths: ast-grep 0.51.0 skips hidden directories but still reports a
+# hidden file at the top of a scanned directory; the mod filters both.
+printf 'foo(5)\n' >"$proj/.hidden.ts"
+mkdir -p "$proj/src/.cache"
+printf 'foo(6)\n' >"$proj/src/.cache/e.ts"
 
 version="$("$bin" --version)"
 cases="$work/cases.jsonl"
@@ -79,6 +84,9 @@ record invalid-pattern typescript 'function {{{' - 51 - .
 record missing-path typescript 'foo($A)' - 51 - nope.ts
 record bad-language cobol 'foo($A)' - 51 - .
 record discover typescript 'foo($A)' 'bar($A)' 1001 - src
+record discover-root typescript 'foo($A)' 'bar($A)' 1001 - .
+record search-hidden-dir typescript 'foo($A)' - 51 - src/.cache
+record stdin-hidden typescript 'foo($A)' 'bar($A)' 1001 "$proj/.hidden.ts"
 record stdin-a typescript 'foo($A)' 'bar($A)' 1001 "$proj/src/a.ts"
 record stdin-d typescript 'foo($A)' 'bar($A)' 1001 "$proj/src/d.ts"
 record unicode typescript 'foo($A)' 'bar($A)' 1001 "$s/unicode"

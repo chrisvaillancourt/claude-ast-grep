@@ -17,6 +17,8 @@ const PROJECT: Record<string, File> = {
   'src/b.ts': { text: '// ünïcödé\nconst b = foo(x, y)\n' },
   'src/c.js': { text: 'foo(3)\n' },
   'src/d.ts': { text: 'foo(4)\n' },
+  '.hidden.ts': { text: 'foo(5)\n' },
+  'src/.cache/e.ts': { text: 'foo(6)\n' },
 }
 
 /** The engine beneath the plugin: a small file system, ast-grep replaying the corpus, and the Write tool. */
@@ -33,7 +35,7 @@ type Hooks = {
 
 function world(on: On, opts: { files?: Record<string, File>; write?: (path: string) => WriteMode; check?: (path: string) => 'allow' | 'deny'; noBinary?: boolean } & Hooks = {}) {
   const files = new Map<string, File>(Object.entries({ ...PROJECT, ...opts.files }).map(([k, v]) => [`${ROOT}/${k}`, v]))
-  const dirs = new Set([ROOT, `${ROOT}/src`, '/w2'])
+  const dirs = new Set([ROOT, `${ROOT}/src`, `${ROOT}/src/.cache`, '/w2'])
   const reads = new Map<string, number>()
   const seen = {
     tools: [] as { name: string; isDeferred?: boolean }[],
@@ -187,6 +189,23 @@ describe('search', () => {
       'src/d.ts:1:1 foo(4) A=4',
     ])
     expect(out.truncated).toBe(false)
+    expect(out.skippedHidden).toEqual(['.hidden.ts'])
+  })
+
+  test('a hidden path named explicitly is searched', async ($, on) => {
+    world(on)
+    await start($)
+    const out = ok(await call($, 'search', { pattern: 'foo($A)', language: 'typescript', paths: ['src/.cache'] }))
+    expect(out.matches.map((m: any) => m.file)).toEqual(['src/.cache/e.ts'])
+    expect(out.skippedHidden).toBeUndefined()
+  })
+
+  test('preview over the whole directory leaves hidden files out, and says so', async ($, on) => {
+    world(on)
+    await start($)
+    const p = ok(await call($, 'preview', { ...FOO, paths: ['.'] }))
+    expect(p.files.map((f: any) => f.path)).toEqual(['src/a.ts', 'src/d.ts'])
+    expect(p.skippedHidden).toEqual(['.hidden.ts'])
   })
 
   test('more matches than maxResults is marked truncated', async ($, on) => {
