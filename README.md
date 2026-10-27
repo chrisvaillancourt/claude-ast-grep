@@ -15,6 +15,15 @@ Each file is written through Claude Code's own Write tool, so your permission ru
 - The tools serve the main conversation only. A subagent's call is refused with an error.
 - Every failure is an explicit error the model reads, with a code (`INVALID_RULE`, `CLI_ERROR`, `STALE`, `OVERLAP`, `TOO_LARGE`, ...). An invalid pattern, a missing path or an unsupported language is never reported as "no matches".
 
+### After a restart
+
+Claude Code can move a session to a new process mid-turn (a background session when the daemon upgrades, a crash and resume). The mod's session state lives in memory and doesn't survive that, so it keeps two small records per session in its own plugin store:
+
+- **An apply in flight.** From before an apply's first Write until it ends, the store holds the preview id, the directory, and for each file its path, the hash it had at preview time, the hash of the previewed content and its status after the last Write. No file content. When the session starts in a new process with that record left over, the mod re-reads and hashes each file and reports which were written, which weren't, and which changed to something else: one log line, a toast, and a notification through your notification channel (in a detached background session your settings `Notification` hooks still receive it, as `plugin_notification`). The apply is never retried. It comes back as the same interrupted record a reload leaves: `/ast-grep status` lists the files, an apply or a preview call answers `INTERRUPTED` with them, and `/ast-grep discard` clears it.
+- **`/ast-grep on|off`.** The override is restored, silently, in a new process for the same session.
+
+A pending preview is not kept: its hashes may be stale by the time a new process starts. After a restart an apply of the old id answers `UNKNOWN_PREVIEW`, and the message names a restart as one of the causes; preview again. A hot reload keeps the session state, so these records are only read in a new process.
+
 ### How a rewrite is computed
 
 1. `ast-grep scan` runs over the paths with a rule the mod writes itself (`--inline-rules` with one pattern, the language and the rewrite as `fix`) and a config file the mod ships (`assets/sgconfig.yml`), so a repository's own `sgconfig.yml`, rule files and custom languages never change the operation. Arguments go to the CLI as an argument vector, never through a shell. The mod uses `scan`, not `run`: `run` exits 0 with no matches on an invalid pattern.
@@ -56,16 +65,16 @@ Out of contract:
 - Files outside the session's directory, symbolic links, hard-link aliases, binary or invalid UTF-8 files, files with a byte-order mark, files over 256 KiB.
 - Semantic or type-aware refactoring; a guarantee that the rewritten code parses.
 - File metadata (mode, timestamps) beyond what the Write tool keeps.
-- An atomic multi-file write, rollback, crash recovery, or protection against a program writing the same files while apply runs.
+- An atomic multi-file write, rollback, resuming an apply that a reload or restart interrupted (it is reported, never resumed), or protection against a program writing the same files while apply runs.
 - Context lines around search matches (ast-grep's JSON output has none; each match carries its own source lines).
 
 ## Command
 
 `/ast-grep [status|on|off|discard]`
 
-- `status` (the default): on or off and why, the ast-grep version found, the pending preview (id, files, time left) and the last apply's outcome.
-- `on` / `off`: turn the tools on or off for this session. Off, every call is refused with a message saying so and a pending preview is dropped. A preview or apply already running when you turn it off stops at its next step: the preview is not kept, and the apply issues no further Write (a Write already issued is not undone). Turning it on again does not resume either. The tools stay registered either way, so the tool list doesn't change mid-session.
-- `discard`: drop the pending preview, or clear the record of an apply a reload interrupted.
+- `status` (the default): on or off and why, the ast-grep version found, the pending preview (id, files, time left) or an interrupted apply with each file's status, and the last apply's outcome.
+- `on` / `off`: turn the tools on or off for this session (kept across a restart of the same session; see [After a restart](#after-a-restart)). Off, every call is refused with a message saying so and a pending preview is dropped. A preview or apply already running when you turn it off stops at its next step: the preview is not kept, and the apply issues no further Write (a Write already issued is not undone). Turning it on again does not resume either. The tools stay registered either way, so the tool list doesn't change mid-session.
+- `discard`: drop the pending preview, or clear the record of an apply a reload or a restart interrupted.
 
 ## Options
 
@@ -104,10 +113,13 @@ ast-grep 0.51.0 or newer on `PATH` (`brew install ast-grep`, `cargo install ast-
 - The diff is exact but not minimal for nearby replacements.
 - A partial apply is not rolled back. Claude Code's own file history (rewind) may hold the earlier content; the mod keeps no copy of its own once the apply ends.
 - A reload during an apply leaves an `interrupted` record listing what was known about each file; the mod never resumes it. `/ast-grep discard` clears it. If the old copy of the module still has a Write in flight at that moment (the engine may let it finish), that Write can land after the record was discarded; its file is then changed with no report. Check the files the record listed before discarding it.
+- A restart keeps only the in-flight apply record and the on/off override. The pending preview, the last apply's outcome (`status`'s "Last apply" line) and anything a running preview had computed are lost. An apply record is kept for 7 days and an override for 30 days from its last change; older ones are pruned when a session starts, so an override set more than 30 days before a restart is forgotten. The interrupted record restored after a restart is reported once: a second restart before `/ast-grep discard` drops it. `/clear` starts a new session id, so an override doesn't carry across it (as before).
+- Because the store is written before the first Write and after each one, a process that dies between a Write landing and that update leaves a status one step behind; the report doesn't trust it and re-hashes every file instead. If a file can't be read after the restart, it is listed as `unknown`.
+- The restart path is covered by the test kit only (a seeded store and an empty session state stand for the new process); it hasn't been reached live.
 - Tools are refused in subagents.
 - On Claude Code 2.1.310 the built-in Edit accepted a file the mod had just written without a fresh Read (the Write call refreshes the engine's record of the file), even though the conversation never saw the new content. The apply result tells the model to Read first anyway.
 - Checked live on Claude Code 2.1.310 in headless sessions (search, preview, apply on CRLF, non-ASCII and no-final-newline files; a stale target; a refused write) and interactively: declining the first file's Write prompt reported `WRITE_DENIED` with 0 files written and the next `unstarted`, and kept the preview pending; applying the same id again and approving wrote every file. The terminal prompt offers no way to edit the proposed content ("Tab to amend" adds a note to the approval), so `userModified` is covered by the test kit only (an IDE diff view may set it). In two live runs that note never reached the model: the engine hands the plugin's Write call no trace of it, so the apply result can't carry it. The test kit also covers a second apply or a discard during an apply (`BUSY`), `/clear` or a directory change right before a write, and `/ast-grep off` during a preview or an apply.
-- A reload during an apply (the `interrupted` record) is not tested. On 2.1.310 a file-save hot reload of a `--plugin-dir` folder, made while an apply waited on its Write prompt, was held until the turn ended (the apply wrote 2 of 2 first), so that path was not reached live.
+- A reload during an apply (the `interrupted` record) is covered by the test kit only. On 2.1.310 a file-save hot reload of a `--plugin-dir` folder, made while an apply waited on its Write prompt, was held until the turn ended (the apply wrote 2 of 2 first), so that path was not reached live.
 
 ## Install
 

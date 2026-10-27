@@ -8,7 +8,10 @@ import {
   isActive,
   parseArgs,
   isSkippedHidden,
+  parseApplyRecord,
+  parseModeRecord,
   relativeTo,
+  restartOutcome,
   statusText,
   validatePreview,
   validatePreviewId,
@@ -170,5 +173,60 @@ describe('formatSearch', () => {
     expect(out.truncated).toBe(true)
     expect(out.matches[0].text).toBe('x'.repeat(400) + '… (4600 more characters)')
     expect(out.count).toBe(out.matches.length)
+  })
+})
+
+describe('what a new process reads back from the store', () => {
+  const H = (c: string) => c.repeat(64)
+  const record = {
+    previewId: 'ag-0123456789ab', root: '/w', at: 5,
+    files: [{ path: 'src/a.ts', beforeHash: H('b'), afterHash: H('a'), replacements: 2, status: 'written' }],
+  }
+
+  test('an apply record of the expected shape is read back; anything else is null', async () => {
+    expect(parseApplyRecord(record)).toEqual(record)
+    const bad: unknown[] = [
+      undefined, null, 'x', [], { ...record, previewId: 'Bad Id' }, { ...record, root: 'w' }, { ...record, at: 'now' },
+      { ...record, files: [] }, { ...record, files: 'nope' },
+      { ...record, files: [{ ...record.files[0], path: '../etc/passwd' }] },
+      { ...record, files: [{ ...record.files[0], path: '/abs' }] },
+      { ...record, files: [{ ...record.files[0], path: 'a//b' }] },
+      { ...record, files: [{ ...record.files[0], beforeHash: 'short' }] },
+      { ...record, files: [{ ...record.files[0], status: 'sideways' }] },
+      { ...record, files: [{ ...record.files[0], replacements: -1 }] },
+      { ...record, files: Array.from({ length: 21 }, () => record.files[0]) },
+    ]
+    for (const b of bad) expect(parseApplyRecord(b)).toBeNull()
+  })
+
+  test('a mode record is on or off with a time', async () => {
+    expect(parseModeRecord({ mode: 'off', at: 1 })).toEqual({ mode: 'off', at: 1 })
+    expect(parseModeRecord({ mode: 'on', at: 0 })).toEqual({ mode: 'on', at: 0 })
+    for (const b of [undefined, { mode: 'sideways', at: 1 }, { mode: 'off' }, { mode: null, at: 1 }, 'off']) expect(parseModeRecord(b)).toBeNull()
+  })
+
+  test('each file re-hashed after a restart: written, not written, changed to something else, or unreadable', async () => {
+    const f = record.files[0]!
+    expect(restartOutcome(f, H('a'))).toEqual({ status: 'written' })
+    expect(restartOutcome(f, H('b'))).toMatchObject({ status: 'not-written' })
+    expect(restartOutcome(f, H('c'))).toMatchObject({ status: 'differs', note: expect.stringMatching(/something else/) })
+    expect(restartOutcome(f, null)).toMatchObject({ status: 'unknown' })
+  })
+
+  test('status names an interrupted apply and lists its files', async () => {
+    const preview = {
+      id: 'p1', sessionId: 's', root: '/r', createdAt: 0, expiresAt: 0, pattern: '', rewrite: '', language: '', replacements: 3,
+      files: [
+        { path: 'a.ts', abs: '/r/a.ts', before: '', beforeHash: 'b', after: '', afterHash: 'a', replacements: 2, status: 'written' as const },
+        { path: 'd.ts', abs: '/r/d.ts', before: '', beforeHash: 'b', after: '', afterHash: 'a', replacements: 1, status: 'differs' as const, note: 'changed' },
+      ],
+      state: 'interrupted' as const, runId: null, epoch: 0,
+    }
+    expect(statusText(configFrom({}), { ...INITIAL, preview }, 0, null)).toBe(
+      'on (from the enabled option); ast-grep not checked yet.\n' +
+      'The apply of preview p1 was interrupted (a reload or a restart) and is never resumed. Check its files, then /ast-grep discard:\n' +
+      '  a.ts: written\n' +
+      '  d.ts: differs (changed)',
+    )
   })
 })

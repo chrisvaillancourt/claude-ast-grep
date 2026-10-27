@@ -1,7 +1,7 @@
 // Pure decisions and text: options, bounds, tool input checks, the /ast-grep
 // command, status, results. No `$`, no I/O; register.ts wires them to events.
 import type { CliMatch } from './cli'
-import type { Config, FileStatus, Mode, Preview, Session } from '../types'
+import type { ApplyRecord, Config, FileStatus, Mode, ModeRecord, Preview, Session } from '../types'
 
 const KIB = 1024
 
@@ -21,6 +21,11 @@ export const MAX_FILE_BYTES = 256 * KIB
 export const MAX_SNAPSHOT_BYTES = 1024 * KIB
 export const MAX_DIFF_BYTES = 64 * KIB
 export const PREVIEW_TTL_MS = 15 * 60_000
+const DAY_MS = 24 * 60 * 60_000
+/** `apply/<session id>` records older than this are pruned at session start. */
+export const APPLY_RECORD_TTL_MS = 7 * DAY_MS
+/** `mode/<session id>` records older than this are pruned at session start; each write refreshes `at`. */
+export const MODE_RECORD_TTL_MS = 30 * DAY_MS
 
 export const INITIAL: Session = { mode: null, preview: null, last: null, epoch: 0 }
 
@@ -58,7 +63,10 @@ export function statusText(config: Config, s: Session, now: number, version: str
   const lines = [`${state} (${source}); ${version ?? 'ast-grep not checked yet'}.`]
   const p = s.preview
   if (p && p.state === 'applying') lines.push(`Preview ${p.id} is being applied, or its apply was interrupted (/ast-grep discard clears it).`)
-  else if (p) {
+  else if (p && p.state === 'interrupted') {
+    lines.push(`The apply of preview ${p.id} was interrupted (a reload or a restart) and is never resumed. Check its files, then /ast-grep discard:`)
+    for (const f of p.files) lines.push(`  ${f.path}: ${f.status}${f.note ? ` (${f.note})` : ''}`)
+  } else if (p) {
     const mins = Math.max(0, Math.ceil((p.expiresAt - now) / 60_000))
     lines.push(`Pending preview ${p.id}: ${p.replacements} replacements in ${p.files.length} files, ${p.expiresAt <= now ? 'expired' : `expires in ${mins} min`}.`)
   } else lines.push('No pending preview.')
@@ -359,9 +367,15 @@ export type LifeEvent =
   | { type: 'discard'; id: string | null }
   | { type: 'expire'; now: number }
   | { type: 'reload' }
+  /**
+   * session.start in a new process: what `$.store` kept for this session id.
+   * Applied only to a record no event has touched (the initial one); a hot
+   * reload finds its record populated and changes nothing.
+   */
+  | { type: 'restore'; mode: Mode | null; interrupted: Preview | null }
 
 export type LifeAction =
-  | { kind: 'published' | 'applying' | 'authorized' | 'recorded' | 'kept' | 'interrupted' }
+  | { kind: 'published' | 'applying' | 'authorized' | 'recorded' | 'kept' | 'interrupted' | 'restored' }
   | { kind: 'discarded'; preview: Preview }
   | { kind: 'dropped'; preview: Preview; why: string }
   | { kind: 'denied'; code: ErrorCode; message: string }
@@ -416,10 +430,10 @@ export function transition(s: Session, e: LifeEvent, config: Config, isLive: (ru
     case 'applyStart': {
       const p = s.preview
       if (!p || p.id !== e.id) {
-        return deny(s, 'UNKNOWN_PREVIEW', p ? `No preview ${e.id}; the pending one is ${p.id}.` : `No preview ${e.id} is pending: it was applied, discarded, dropped or never made. Preview again.`)
+        return deny(s, 'UNKNOWN_PREVIEW', p ? `No preview ${e.id}; the pending one is ${p.id}.` : `No preview ${e.id} is pending: it was applied, discarded, dropped or never made, or Claude Code restarted since (previews are not kept across a restart). Preview again.`)
       }
       if (running(p)) return deny(s, 'BUSY', `Preview ${p.id} is being applied right now.`)
-      if (p.state !== 'pending') return deny(s, 'INTERRUPTED', `An apply of preview ${p.id} was interrupted (a reload or a failure inside the plugin); it is never resumed. Check the files, then /ast-grep discard.`)
+      if (p.state !== 'pending') return deny(s, 'INTERRUPTED', `An apply of preview ${p.id} was interrupted (a reload, a restart or a failure inside the plugin); it is never resumed. Check the files, then /ast-grep discard.`)
       // The preview's own epoch is the authority; the caller passes none.
       if (p.epoch !== s.epoch) {
         const d = drop(s, 'revoked by /ast-grep off')
@@ -493,5 +507,89 @@ export function transition(s: Session, e: LifeEvent, config: Config, isLive: (ru
       if (!p || p.state !== 'applying') return { record: s, actions: [] }
       return { record: { ...s, preview: { ...p, state: 'interrupted' } }, actions: [{ kind: 'interrupted' }] }
     }
+    case 'restore': {
+      const untouched = s.preview === null && s.mode === null && s.last === null && s.epoch === 0
+      if (!untouched || (e.mode === null && e.interrupted === null)) return { record: s, actions: [] }
+      const preview = e.interrupted ? { ...e.interrupted, state: 'interrupted' as const, runId: null, epoch: s.epoch } : null
+      return { record: { ...s, mode: e.mode, preview }, actions: [{ kind: 'restored' }] }
+    }
+  }
+}
+
+// ---------- what a new process reads back from $.store ----------
+//
+// A `$.store` value may come from an older version or be corrupted: anything
+// that doesn't parse as the expected shape is null, and the caller drops it.
+
+const HASH = /^[0-9a-f]{64}$/
+const STATUSES: readonly FileStatus[] = ['unstarted', 'writing', 'written', 'refused', 'failed', 'not-written', 'differs', 'unknown']
+
+const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
+const isTime = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v)
+
+/** A relative, `/`-separated path with no empty, `.` or `..` segment. */
+function isRelativePath(v: unknown): v is string {
+  return typeof v === 'string' && v.length > 0 && v.length <= 4096 && !v.startsWith('/') && !v.includes('\u0000') &&
+    v.split('/').every(seg => seg !== '' && seg !== '.' && seg !== '..')
+}
+
+export function parseApplyRecord(v: unknown): ApplyRecord | null {
+  if (!isObject(v)) return null
+  const { previewId, root, at, files } = v
+  if (typeof previewId !== 'string' || !PREVIEW_ID.test(previewId)) return null
+  if (typeof root !== 'string' || !root.startsWith('/') || root.length > 4096 || root.includes('\u0000')) return null
+  if (!isTime(at) || !Array.isArray(files) || files.length === 0 || files.length > MAX_FILES) return null
+  const out: ApplyRecord['files'] = []
+  for (const f of files) {
+    if (!isObject(f) || !isRelativePath(f.path)) return null
+    if (typeof f.beforeHash !== 'string' || !HASH.test(f.beforeHash) || typeof f.afterHash !== 'string' || !HASH.test(f.afterHash)) return null
+    const r = f.replacements
+    if (typeof r !== 'number' || !Number.isInteger(r) || r < 0 || r > MAX_REPLACEMENTS) return null
+    if (!STATUSES.includes(f.status as FileStatus)) return null
+    out.push({ path: f.path, beforeHash: f.beforeHash, afterHash: f.afterHash, replacements: r, status: f.status as FileStatus })
+  }
+  return { previewId, root, at, files: out }
+}
+
+export function parseModeRecord(v: unknown): ModeRecord | null {
+  if (!isObject(v) || (v.mode !== 'on' && v.mode !== 'off') || !isTime(v.at)) return null
+  return { mode: v.mode, at: v.at }
+}
+
+/** A file of a lost apply, judged by its hash now (null: unreadable). */
+export function restartOutcome(f: { beforeHash: string; afterHash: string }, hash: string | null): { status: FileStatus; note?: string } {
+  if (hash === null) return { status: 'unknown', note: 'could not be read after the restart' }
+  if (hash === f.afterHash) return { status: 'written' }
+  if (hash === f.beforeHash) return { status: 'not-written', note: 'still as it was before the apply' }
+  return { status: 'differs', note: 'changed to something else: neither its content before the apply nor the previewed content' }
+}
+
+/** The lost apply as the interrupted preview a reload would have left: hashes and outcomes, no content. */
+export function interruptedPreview(r: ApplyRecord, sessionId: string, outcomes: readonly { status: FileStatus; note?: string }[]): Preview {
+  const files = r.files.map((f, i) => {
+    const o = outcomes[i] ?? { status: 'unknown' as const }
+    return {
+      path: f.path, abs: r.root === '/' ? `/${f.path}` : `${r.root}/${f.path}`, before: '', beforeHash: f.beforeHash, after: '',
+      afterHash: f.afterHash, replacements: f.replacements, status: o.status, ...(o.note ? { note: o.note } : {}),
+    }
+  })
+  return {
+    id: r.previewId, sessionId, root: r.root, createdAt: r.at, expiresAt: r.at, pattern: '', rewrite: '', language: '',
+    replacements: files.reduce((n, f) => n + f.replacements, 0), files, epoch: 0, state: 'interrupted', runId: null,
+  }
+}
+
+/** The log line, toast and notification for an apply a restart cut short. */
+export function restartReport(p: Preview): { log: string; toast: string; notify: string } {
+  const by = (st: FileStatus) => p.files.filter(f => f.status === st).map(f => f.path)
+  const written = by('written')
+  const count = `${written.length} of ${p.files.length} files written`
+  const parts = [written.length > 0 ? `${count} (${written.join(', ')})` : count]
+  const rest: [string, string[]][] = [['not written', by('not-written')], ['changed to something else', by('differs')], ['unreadable', by('unknown')]]
+  for (const [what, paths] of rest) if (paths.length > 0) parts.push(`${what}: ${paths.join(', ')}`)
+  return {
+    log: `a restart interrupted the apply of preview ${p.id} in ${p.root}: ${parts.join('; ')}. It was not retried. Check those files, then /ast-grep discard.`,
+    toast: `a restart interrupted an apply: ${count}; see the log`,
+    notify: `A restart interrupted an ast-grep apply in ${p.root}: ${count}. Check the files, then /ast-grep discard.`,
   }
 }

@@ -36,6 +36,7 @@ const EVENTS: Record<string, LifeEvent> = {
   discard: { type: 'discard', id: 'p1' },
   expire: { type: 'expire', now: 0 },
   reload: { type: 'reload' },
+  restore: { type: 'restore', mode: 'off', interrupted: preview({ id: 'p9', state: 'interrupted', runId: null, epoch: 7 }) },
 }
 
 /** What a transition did, in one word each: the preview after it (`id:state`), and the action or denial. */
@@ -51,37 +52,38 @@ function outcome(s: Session, e: LifeEvent, isLive: (runId: string) => boolean = 
 }
 
 // Every state × event pair: the preview after the event, and what the transition answered.
+// `restore` changes only a record no event has touched yet (a new process); every state here has epoch 1.
 const TABLE: Record<string, Record<string, string>> = {
   none: {
     publish: 'p2:pending published', applyStart: 'none UNKNOWN_PREVIEW', writeAuthorized: 'none SESSION_CHANGED',
     writeResult: 'none -', applyEndRetain: 'none -', applyEndDrop: 'none -', off: 'none -', on: 'none -',
-    clear: 'none -', discard: 'none UNKNOWN_PREVIEW', expire: 'none -', reload: 'none -',
+    clear: 'none -', discard: 'none UNKNOWN_PREVIEW', expire: 'none -', reload: 'none -', restore: 'none -',
   },
   pending: {
     publish: 'p1:pending PREVIEW_PENDING', applyStart: 'p1:applying applying', writeAuthorized: 'p1:pending SESSION_CHANGED',
     writeResult: 'p1:pending -', applyEndRetain: 'p1:pending -', applyEndDrop: 'p1:pending -', off: 'none dropped',
-    on: 'p1:pending -', clear: 'none -', discard: 'none discarded', expire: 'p1:pending -', reload: 'p1:pending -',
+    on: 'p1:pending -', clear: 'none -', discard: 'none discarded', expire: 'p1:pending -', reload: 'p1:pending -', restore: 'p1:pending -',
   },
   expired: {
     publish: 'p2:pending dropped+published', applyStart: 'none dropped+EXPIRED', writeAuthorized: 'p1:pending SESSION_CHANGED',
     writeResult: 'p1:pending -', applyEndRetain: 'p1:pending -', applyEndDrop: 'p1:pending -', off: 'none dropped',
-    on: 'p1:pending -', clear: 'none -', discard: 'none discarded', expire: 'none dropped', reload: 'p1:pending -',
+    on: 'p1:pending -', clear: 'none -', discard: 'none discarded', expire: 'none dropped', reload: 'p1:pending -', restore: 'p1:pending -',
   },
   revoked: {
     publish: 'p2:pending dropped+published', applyStart: 'none dropped+REVOKED', writeAuthorized: 'p1:pending SESSION_CHANGED',
     writeResult: 'p1:pending -', applyEndRetain: 'p1:pending -', applyEndDrop: 'p1:pending -', off: 'none dropped',
-    on: 'p1:pending -', clear: 'none -', discard: 'none discarded', expire: 'none dropped', reload: 'p1:pending -',
+    on: 'p1:pending -', clear: 'none -', discard: 'none discarded', expire: 'none dropped', reload: 'p1:pending -', restore: 'p1:pending -',
   },
   applying: {
     publish: 'p1:applying PREVIEW_PENDING', applyStart: 'p1:applying BUSY', writeAuthorized: 'p1:applying authorized',
     writeResult: 'p1:applying recorded', applyEndRetain: 'p1:pending kept', applyEndDrop: 'none dropped',
     off: 'p1:applying -', on: 'p1:applying -', clear: 'none -', discard: 'p1:applying BUSY', expire: 'p1:applying -',
-    reload: 'p1:interrupted interrupted',
+    reload: 'p1:interrupted interrupted', restore: 'p1:applying -',
   },
   interrupted: {
     publish: 'p1:interrupted PREVIEW_PENDING', applyStart: 'p1:interrupted INTERRUPTED', writeAuthorized: 'p1:interrupted SESSION_CHANGED',
     writeResult: 'p1:interrupted -', applyEndRetain: 'p1:interrupted -', applyEndDrop: 'p1:interrupted -', off: 'none dropped',
-    on: 'p1:interrupted -', clear: 'none -', discard: 'none discarded', expire: 'p1:interrupted -', reload: 'p1:interrupted -',
+    on: 'p1:interrupted -', clear: 'none -', discard: 'none discarded', expire: 'p1:interrupted -', reload: 'p1:interrupted -', restore: 'p1:interrupted -',
   },
 }
 
@@ -147,6 +149,19 @@ describe('transition: epochs and authority', () => {
   test('the discard action carries the preview it removed, so reports come from the record the update decided on', async () => {
     const { actions } = transition(STATES.interrupted!, EVENTS.discard!, CONFIG, DEAD)
     expect(actions).toEqual([{ kind: 'discarded', preview: STATES.interrupted!.preview }])
+  })
+
+  test('restore fills a new process\'s initial record: the interrupted apply and the override, nothing else', async () => {
+    const e = EVENTS.restore as Extract<LifeEvent, { type: 'restore' }>
+    const { record, actions } = transition(INITIAL, e, CONFIG, DEAD)
+    expect(actions).toEqual([{ kind: 'restored' }])
+    expect(record).toEqual({ ...INITIAL, mode: 'off', preview: { ...e.interrupted!, state: 'interrupted', runId: null, epoch: 0 } })
+    // nothing to restore, or a record this process already wrote (a hot reload): unchanged
+    expect(transition(INITIAL, { type: 'restore', mode: null, interrupted: null }, CONFIG, DEAD)).toEqual({ record: INITIAL, actions: [] })
+    expect(transition({ ...INITIAL, last: 'x' }, e, CONFIG, DEAD).actions).toEqual([])
+    expect(transition({ ...INITIAL, mode: 'on' }, e, CONFIG, DEAD).actions).toEqual([])
+    // the restored apply is never resumed
+    expect(outcome(record, { ...(EVENTS.applyStart as Extract<LifeEvent, { type: 'applyStart' }>), id: 'p9' }, DEAD)).toBe('p9:interrupted INTERRUPTED')
   })
 
   test('writeAuthorized marks the file writing; writeResult records the outcome', async () => {

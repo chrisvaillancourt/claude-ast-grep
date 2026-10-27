@@ -1,6 +1,6 @@
 {
   "name": "ast-grep",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Structural code search and previewed, staged rewrites through the ast-grep CLI.",
   "types": "./types/index.d.ts",
   "userConfig": {

@@ -2,6 +2,7 @@ import { describe, expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
 import { CORPUS } from './corpus'
+import { sha256Text } from './edit'
 
 const COMMAND = { origin: { kind: 'composer' as const }, presentation: { isFullscreen: false, columns: 120 } }
 const ROOT = '/w'
@@ -33,7 +34,18 @@ type Hooks = {
   onStdinScan?: ($: any) => unknown
 }
 
-function world(on: On, opts: { files?: Record<string, File>; write?: (path: string) => WriteMode | Promise<WriteMode>; check?: (path: string) => 'allow' | 'deny' | Promise<'allow' | 'deny'>; noBinary?: boolean } & Hooks = {}) {
+type WorldOptions = {
+  files?: Record<string, File>
+  write?: (path: string) => WriteMode | Promise<WriteMode>
+  check?: (path: string) => 'allow' | 'deny' | Promise<'allow' | 'deny'>
+  noBinary?: boolean
+  /** What `$.store` holds at the start: a new process finds what an earlier one left there. */
+  store?: Record<string, unknown>
+  /** Every `$.store` call is refused. */
+  storeFails?: boolean
+}
+
+function world(on: On, opts: WorldOptions & Hooks = {}) {
   const files = new Map<string, File>(Object.entries({ ...PROJECT, ...opts.files }).map(([k, v]) => [`${ROOT}/${k}`, v]))
   const dirs = new Set([ROOT, `${ROOT}/src`, `${ROOT}/src/.cache`, `${ROOT}/hiddenScope`, `${ROOT}/visibleScope`, `${ROOT}/visibleScope/sub`, '/w2'])
   const reads = new Map<string, number>()
@@ -47,6 +59,10 @@ function world(on: On, opts: { files?: Record<string, File>; write?: (path: stri
     sessionId: 's1',
     cwd: ROOT,
     clock: mock.clock(on),
+    // The store as a map the test can read back (the kit's mock.store keeps its own).
+    store: new Map<string, unknown>(Object.entries(opts.store ?? {})),
+    toasts: [] as string[],
+    notifies: [] as { text: string; title?: string }[],
   }
   const abs = (p: string) => (p.startsWith('/') ? p : `${ROOT}/${p}`).replace(/\/\.$/, '').replace(/\/$/, '')
   on('session.start', ($, e) => ({ cwd: e.cwd }))
@@ -57,6 +73,27 @@ function world(on: On, opts: { files?: Record<string, File>; write?: (path: stri
     seen.logs.push(e.text)
     return { value: undefined }
   })
+  on('ui.toast', ($, e) => {
+    seen.toasts.push(e.text)
+    return { value: undefined }
+  })
+  on('ui.notify', ($, e) => {
+    seen.notifies.push({ text: e.text, ...(e.title ? { title: e.title } : {}) })
+    // A detached background session has no channel; the person's Notification hooks still hear it.
+    return { value: { isSent: false, reason: 'no-channel' } }
+  })
+  on('store.get', ($, e) => (opts.storeFails ? { deny: 'store unavailable' } : { value: seen.store.get(e.key) }))
+  on('store.set', ($, e) => {
+    if (opts.storeFails) return { deny: 'store unavailable' }
+    seen.store.set(e.key, JSON.parse(JSON.stringify(e.value)))
+    return { value: undefined }
+  })
+  on('store.delete', ($, e) => {
+    if (opts.storeFails) return { deny: 'store unavailable' }
+    seen.store.delete(e.key)
+    return { value: undefined }
+  })
+  on('store.keys', () => (opts.storeFails ? { deny: 'store unavailable' } : { value: [...seen.store.keys()] }))
   on('command.register', ($, e) => {
     seen.commands.push(e.name)
     return { value: { command: e.name } }
@@ -724,5 +761,204 @@ describe('round-3 regression: discard during an in-flight Write', () => {
       apply: applied.deny ? JSON.parse(applied.deny).code : JSON.parse(applied.result as string).status,
       writes: seen.writes.map(w => w.path),
     }).toEqual({ discard: 'BUSY', apply: 'applied', writes: ['/w/src/a.ts', '/w/src/d.ts'] })
+  })
+})
+
+describe('a new process: what survives a restart', () => {
+  const DAY = 24 * 60 * 60_000
+  const A0 = 'const a = foo(1)\nfoo(2)\n'
+  const A1 = 'const a = bar(1)\nbar(2)\n'
+  const clone = (v: unknown) => JSON.parse(JSON.stringify(v ?? null))
+  const status = async ($: any) => (await $.command.run({ command: 'ast-grep', args: 'status', ...COMMAND })).text as string
+  /** An apply record a process left behind for session s1: a.ts written, d.ts not reached, c.js changed by something else. */
+  const leftover = async (at = 0) => ({
+    previewId: 'ag-0123456789ab', root: ROOT, at,
+    files: [
+      { path: 'src/a.ts', beforeHash: await sha256Text(A0), afterHash: await sha256Text(A1), replacements: 2, status: 'written' },
+      { path: 'src/d.ts', beforeHash: await sha256Text('foo(4)\n'), afterHash: await sha256Text('bar(4)\n'), replacements: 1, status: 'unstarted' },
+      { path: 'src/c.js', beforeHash: await sha256Text('foo(3)\n'), afterHash: await sha256Text('bar(3)\n'), replacements: 1, status: 'unstarted' },
+    ],
+  })
+
+  test('an apply keeps a record from before its first Write until it ends; a preview keeps none', async ($, on) => {
+    const atWrite: unknown[] = []
+    const seen = world(on, { write: () => { atWrite.push(clone(seen.store.get('apply/s1'))); return 'ok' } })
+    await start($)
+    const p = ok(await call($, 'preview', { ...FOO, paths: ['src'] }))
+    expect([...seen.store.keys()].filter(k => k.startsWith('apply/'))).toEqual([])
+    ok(await call($, 'apply', { previewId: p.previewId }))
+    expect(atWrite[0]).toEqual({
+      previewId: p.previewId, root: ROOT, at: expect.any(Number),
+      files: [
+        { path: 'src/a.ts', beforeHash: await sha256Text(A0), afterHash: await sha256Text(A1), replacements: 2, status: 'unstarted' },
+        { path: 'src/d.ts', beforeHash: await sha256Text('foo(4)\n'), afterHash: await sha256Text('bar(4)\n'), replacements: 1, status: 'unstarted' },
+      ],
+    })
+    expect((atWrite[1] as any).files.map((f: any) => f.status)).toEqual(['written', 'unstarted'])
+    expect(seen.store.has('apply/s1')).toBe(false)
+  })
+
+  test('a refused, stale or partly refused apply leaves no record', async ($, on) => {
+    let refuse = 'a.ts'
+    const seen = world(on, { write: p => (p.endsWith(refuse) ? 'deny' : 'ok') })
+    await start($)
+    const p = ok(await call($, 'preview', { ...FOO, paths: ['src'] }))
+    expect(err(await call($, 'apply', { previewId: p.previewId })).code).toBe('WRITE_DENIED')
+    expect(seen.store.has('apply/s1')).toBe(false)
+    refuse = 'd.ts'
+    expect(err(await call($, 'apply', { previewId: p.previewId })).code).toBe('WRITE_DENIED')
+    expect(seen.store.has('apply/s1')).toBe(false)
+    seen.files.set('/w/src/a.ts', { text: A0 })
+    const q = ok(await call($, 'preview', { ...FOO, paths: ['src'] }))
+    seen.files.set('/w/src/d.ts', { text: 'foo(5)\n' })
+    expect(err(await call($, 'apply', { previewId: q.previewId })).code).toBe('STALE')
+    expect(seen.store.has('apply/s1')).toBe(false)
+  })
+
+  test('an apply record left by another process is reported per file, kept as interrupted, notified once, never retried', async ($, on) => {
+    const other = { ...(await leftover()), previewId: 'ag-ffffffffffff' }
+    const seen = world(on, {
+      files: { 'src/a.ts': { text: A1 }, 'src/c.js': { text: 'baz(3)\n' } },
+      store: { 'apply/s1': await leftover(), 'apply/s2': other, unrelated: { at: 0 } },
+    })
+    await start($)
+    expect(seen.logs).toHaveLength(1)
+    const line = seen.logs[0]!
+    expect(line).toMatch(/restart/i)
+    expect(line).toContain('ag-0123456789ab')
+    expect(line).toMatch(/1 of 3 files written/)
+    expect(line).toContain('src/a.ts')
+    expect(line).toContain('src/d.ts')
+    expect(line).toContain('src/c.js')
+    expect(line).toContain('/ast-grep discard')
+    expect(line.startsWith('ast-grep')).toBe(false)
+    expect(seen.toasts).toHaveLength(1)
+    expect(seen.notifies).toHaveLength(1)
+    expect(seen.notifies[0]!.text).toMatch(/1 of 3 files written/)
+    // reported once: the record is gone; other sessions' records and other keys are untouched
+    expect(seen.store.has('apply/s1')).toBe(false)
+    expect(seen.store.get('apply/s2')).toEqual(other)
+    expect(seen.store.get('unrelated')).toEqual({ at: 0 })
+
+    const st = await status($)
+    expect(st).toContain('ag-0123456789ab')
+    expect(st).toMatch(/interrupted/)
+    expect(st).toContain('src/c.js')
+    const e = err(await call($, 'apply', { previewId: 'ag-0123456789ab' }))
+    expect(e.code).toBe('INTERRUPTED')
+    expect(e.message).toMatch(/restart/)
+    expect(e.files.map((f: any) => `${f.path}:${f.status}`)).toEqual(['src/a.ts:written', 'src/d.ts:not-written', 'src/c.js:differs'])
+    expect(err(await call($, 'preview', { ...FOO, paths: ['src'] })).code).toBe('INTERRUPTED')
+    expect(seen.writes).toEqual([])
+
+    const d = (await $.command.run({ command: 'ast-grep', args: 'discard', ...COMMAND })).text as string
+    expect(d).toContain('Discarded preview ag-0123456789ab (an interrupted apply)')
+    await start($)
+    expect(seen.logs).toHaveLength(1)
+    expect(seen.notifies).toHaveLength(1)
+  })
+
+  test('a hot reload mid-apply reports no restart, keeps the record while the interrupted one stands, and discard removes it', async ($, on) => {
+    let reloaded = false
+    const seen = world(on, {
+      afterWrite: async () => {
+        if (reloaded) return
+        reloaded = true
+        await start($)
+      },
+    })
+    await start($)
+    const p = ok(await call($, 'preview', { ...FOO, paths: ['src'] }))
+    err(await call($, 'apply', { previewId: p.previewId }))
+    expect(seen.logs.some(l => /restart/i.test(l))).toBe(false)
+    expect(seen.notifies).toEqual([])
+    expect(seen.toasts).toEqual([])
+    expect((seen.store.get('apply/s1') as any)?.previewId).toBe(p.previewId)
+    expect(await status($)).toMatch(/interrupted/)
+
+    await start($)
+    expect(seen.logs.some(l => /restart/i.test(l))).toBe(false)
+    expect(seen.notifies).toEqual([])
+    await $.command.run({ command: 'ast-grep', args: 'discard', ...COMMAND })
+    expect(seen.store.has('apply/s1')).toBe(false)
+  })
+
+  test('/ast-grep on|off is kept per session; a new process restores it without a notice', async ($, on) => {
+    const seen = world(on, { store: { 'mode/s2': { mode: 'on', at: 0 } } })
+    await start($)
+    await seen.clock.advance(5000)
+    await $.command.run({ command: 'ast-grep', args: 'off', ...COMMAND })
+    expect(seen.store.get('mode/s1')).toEqual({ mode: 'off', at: 5000 })
+    await $.command.run({ command: 'ast-grep', args: 'on', ...COMMAND })
+    expect(seen.store.get('mode/s1')).toEqual({ mode: 'on', at: 5000 })
+    expect(seen.store.get('mode/s2')).toEqual({ mode: 'on', at: 0 })
+  })
+
+  test('a new process with an off record starts off', async ($, on) => {
+    const seen = world(on, { store: { 'mode/s1': { mode: 'off', at: 0 } } })
+    await start($)
+    expect(err(await call($, 'search', { pattern: 'foo($A)', language: 'typescript' })).code).toBe('OFF')
+    expect(await status($)).toMatch(/^off \(set for this session\)/)
+    expect(seen.logs).toEqual([])
+    expect(seen.toasts).toEqual([])
+    expect(seen.notifies).toEqual([])
+    expect((seen.store.get('mode/s1') as any)?.mode).toBe('off')
+  })
+
+  test('a hot reload leaves the session\'s own state alone, whatever the store holds', async ($, on) => {
+    const seen = world(on, { store: { 'mode/s1': { mode: 'off', at: 0 } } })
+    await start($)
+    await $.command.run({ command: 'ast-grep', args: 'on', ...COMMAND })
+    seen.store.set('mode/s1', { mode: 'off', at: 0 })
+    seen.store.set('apply/s1', await leftover())
+    await start($)
+    expect(await status($)).toMatch(/^on \(set for this session\)/)
+    expect(await status($)).toContain('No pending preview')
+    expect(seen.logs).toEqual([])
+    expect(seen.notifies).toEqual([])
+  })
+
+  test('a record of the wrong shape is ignored and removed', async ($, on) => {
+    const seen = world(on, { store: { 'apply/s1': { previewId: 'x', files: 'nope' }, 'mode/s1': { mode: 'sideways', at: 0 } } })
+    await start($)
+    expect(seen.logs).toEqual([])
+    expect(seen.notifies).toEqual([])
+    expect(seen.store.has('apply/s1')).toBe(false)
+    expect(seen.store.has('mode/s1')).toBe(false)
+    expect(await status($)).toMatch(/^on \(from the enabled option\)/)
+  })
+
+  test('records past their time are pruned: apply after 7 days, mode after 30; other keys are untouched', async ($, on) => {
+    const seen = world(on)
+    await seen.clock.advance(60 * DAY)
+    const now = 60 * DAY
+    for (const [k, v] of Object.entries({
+      'apply/old': { ...(await leftover(now - 8 * DAY)) },
+      'apply/recent': { ...(await leftover(now - DAY)) },
+      'mode/old': { mode: 'off', at: now - 31 * DAY },
+      'mode/recent': { mode: 'off', at: now - 10 * DAY },
+      'apply/broken': 'garbage',
+      lastSomething: { at: 0 },
+    })) seen.store.set(k, v)
+    await start($)
+    expect([...seen.store.keys()].sort()).toEqual(['apply/recent', 'lastSomething', 'mode/recent'])
+    expect(seen.logs).toEqual([])
+  })
+
+  test('a store that refuses every call changes nothing else', async ($, on) => {
+    const seen = world(on, { storeFails: true })
+    await start($)
+    const p = ok(await call($, 'preview', { ...FOO, paths: ['src'] }))
+    expect(ok(await call($, 'apply', { previewId: p.previewId })).status).toBe('applied')
+    await $.command.run({ command: 'ast-grep', args: 'off', ...COMMAND })
+    expect(await status($)).toMatch(/^off/)
+    expect(seen.notifies).toEqual([])
+    expect(seen.logs.filter(l => /internal error/.test(l))).toEqual([])
+  })
+
+  test('after a restart, an unknown preview id says previews are not kept across one', async ($, on) => {
+    world(on)
+    await start($)
+    expect(err(await call($, 'apply', { previewId: 'ag-0123456789ab' })).message).toMatch(/restart/)
   })
 })

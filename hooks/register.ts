@@ -5,23 +5,30 @@ import { isSupported, parseScan, parseVersion, ruleText, scanArgv } from './cli'
 import type { CliMatch, RunResult, ScanTarget } from './cli'
 import { base64Bytes, decodeFile, planEdits, sha256Bytes, sha256Text, unifiedDiff, utf8Length } from './edit'
 import {
+  APPLY_RECORD_TTL_MS,
   INITIAL,
   MAX_DIFF_BYTES,
   MAX_FILES,
   MAX_FILE_BYTES,
   MAX_REPLACEMENTS,
   MAX_SNAPSHOT_BYTES,
+  MODE_RECORD_TTL_MS,
   PREVIEW_TTL_MS,
   TOOLS,
   USAGE,
   configFrom,
   errorText,
   formatSearch,
+  interruptedPreview,
   isActive,
   isSkippedHidden,
+  parseApplyRecord,
   parseArgs,
+  parseModeRecord,
   previewText,
   relativeTo,
+  restartOutcome,
+  restartReport,
   statusText,
   transition,
   validatePreview,
@@ -29,7 +36,7 @@ import {
   validateSearch,
 } from './policy'
 import type { ErrorCode, LifeEvent, Step } from './policy'
-import type { Config, FileStatus, Preview, PreviewFile, Session } from '../types'
+import type { ApplyRecord, Config, FileStatus, Mode, Preview, PreviewFile, Session } from '../types'
 
 const NAME = 'ast-grep'
 const SEARCH = 'mcp__ast-grep__search'
@@ -59,6 +66,26 @@ class Refusal extends Error {
 function log($: EngineInterface, text: string) {
   try {
     $.ui.log(text)
+  } catch {
+    // nothing to do
+  }
+}
+
+function toast($: EngineInterface, text: string) {
+  try {
+    $.ui.toast(text)
+  } catch {
+    // nothing to do
+  }
+}
+
+/**
+ * Never awaited: in a detached background session it resolves `no-channel`,
+ * while the person's Notification hooks still hear it.
+ */
+function notify($: EngineInterface, text: string) {
+  try {
+    $.ui.notify(text).catch(() => undefined)
   } catch {
     // nothing to do
   }
@@ -127,6 +154,135 @@ async function snapshot($: EngineInterface, abs: string): Promise<{ b64: string;
   }
 }
 
+// ---------- what survives a new process: $.store ----------
+//
+// `$.state` survives a hot reload but not a new process (an upgrade moving a
+// background session, a crash and resume). Two records per session id do:
+// `apply/<id>` while an apply writes, and `mode/<id>` for /ast-grep on|off.
+// The store is shared by every session of the plugin, so each key names its
+// session. Every store call is best effort: a failure never fails a hook or
+// changes what the mod does.
+
+const applyKey = (sessionId: string) => `apply/${sessionId}`
+const modeKey = (sessionId: string) => `mode/${sessionId}`
+
+async function storeSet($: EngineInterface, key: string, value: unknown) {
+  try {
+    await $.store.set(key, value)
+  } catch {
+    // best effort
+  }
+}
+
+async function storeDelete($: EngineInterface, key: string) {
+  try {
+    await $.store.delete(key)
+  } catch {
+    // best effort
+  }
+}
+
+/** Drops this session's apply record if it is the one for `previewId`. */
+async function forgetApply($: EngineInterface, sessionId: string, previewId: string) {
+  try {
+    if (parseApplyRecord(await $.store.get(applyKey(sessionId)))?.previewId === previewId) await $.store.delete(applyKey(sessionId))
+  } catch {
+    // best effort
+  }
+}
+
+/**
+ * The apply has ended: its record goes, unless the session record still holds
+ * it applying or interrupted (a reload or a failure inside the plugin cut it
+ * short), which keeps it reported until it is discarded.
+ */
+async function settleApply($: EngineInterface, sessionId: string, id: string, runId: string) {
+  try {
+    const held = (await read($, sessionAtom)).preview
+    if (held && held.id === id && held.runId === runId && held.state !== 'pending') return
+  } catch {
+    // fall through: forget it
+  }
+  await forgetApply($, sessionId, id)
+}
+
+async function keepMode($: EngineInterface, mode: Mode | null) {
+  try {
+    const key = modeKey(await $.session.id())
+    if (mode === null) await $.store.delete(key)
+    else await $.store.set(key, { mode, at: await $.clock.now() })
+  } catch {
+    // best effort
+  }
+}
+
+/**
+ * session.start: in a new process (this session's record untouched) what the
+ * store kept for this session id comes back. A lost apply returns as the
+ * interrupted preview a reload would have left, its files re-hashed, and is
+ * reported; it is never retried. The override returns silently. In a hot
+ * reload the record is populated and both records are left alone.
+ */
+async function restoreAfterRestart($: EngineInterface) {
+  try {
+    const s = await read($, sessionAtom)
+    // A quick look; the restore transition decides again inside its update.
+    if (s.preview !== null || s.mode !== null || s.last !== null || s.epoch !== 0) return
+    const sessionId = await $.session.id()
+    const now = await $.clock.now()
+    const rawApply = await $.store.get(applyKey(sessionId))
+    const rawMode = await $.store.get(modeKey(sessionId))
+    const lost = parseApplyRecord(rawApply)
+    const mode = parseModeRecord(rawMode)
+    const isLost = lost !== null && now - lost.at <= APPLY_RECORD_TTL_MS
+    const isMode = mode !== null && now - mode.at <= MODE_RECORD_TTL_MS
+    if (rawApply !== undefined && !isLost) await storeDelete($, applyKey(sessionId))
+    if (rawMode !== undefined && !isMode) await storeDelete($, modeKey(sessionId))
+    let interrupted: Preview | null = null
+    if (isLost) {
+      const outcomes: { status: FileStatus; note?: string }[] = []
+      for (const f of lost.files) {
+        const snap = await snapshot($, lost.root === '/' ? `/${f.path}` : `${lost.root}/${f.path}`)
+        outcomes.push(restartOutcome(f, snap?.hash ?? null))
+      }
+      interrupted = interruptedPreview(lost, sessionId, outcomes)
+    }
+    if (!interrupted && !isMode) return
+    const done = await step($, { type: 'restore', mode: isMode ? mode.mode : null, interrupted })
+    if (!done.actions.some(a => a.kind === 'restored')) return
+    if (isMode) await storeSet($, modeKey(sessionId), { mode: mode.mode, at: now })
+    const held = done.record.preview
+    if (isLost && held) {
+      const r = restartReport(held)
+      log($, r.log)
+      toast($, r.toast)
+      // Serious: a change set may be half applied in the person's repository.
+      notify($, r.notify)
+      await storeDelete($, applyKey(sessionId))
+    }
+  } catch {
+    // Restoring and reporting must never throw out of session.start.
+  }
+}
+
+/** Drops apply records older than 7 days and mode records older than 30, and any of the wrong shape; never another key. */
+async function pruneRecords($: EngineInterface) {
+  try {
+    const now = await $.clock.now()
+    for (const key of await $.store.keys()) {
+      if (key.startsWith('apply/')) {
+        const r = parseApplyRecord(await $.store.get(key))
+        if (!r || now - r.at > APPLY_RECORD_TTL_MS) await storeDelete($, key)
+      } else if (key.startsWith('mode/')) {
+        const r = parseModeRecord(await $.store.get(key))
+        if (!r || now - r.at > MODE_RECORD_TTL_MS) await storeDelete($, key)
+      }
+    }
+  } catch {
+    // best effort
+  }
+}
+
 // ---------- the CLI ----------
 
 async function ensureCli($: EngineInterface): Promise<void> {
@@ -168,11 +324,17 @@ async function guard($: EngineInterface, e: { agentId?: string }): Promise<Sessi
 /** Applies one lifecycle event in one versioned update; returns what the transition did. */
 async function step($: EngineInterface, ev: LifeEvent): Promise<Step> {
   let out: Step = { record: INITIAL, actions: [] }
+  let before: Session = INITIAL
   await update($, sessionAtom, s => {
     // Liveness is asked inside the update, of the record's own run id, on every retry.
+    before = s
     out = transition(s, ev, config, runId => liveRuns.has(runId))
     return out.record
   })
+  // An applying or interrupted preview keeps its apply record in the store; once
+  // the session record no longer holds it (discard, off, /clear, the apply's end), neither does the store.
+  const gone = before.preview
+  if (gone && gone.state !== 'pending' && out.record.preview?.id !== gone.id) await forgetApply($, gone.sessionId, gone.id)
   return out
 }
 
@@ -208,6 +370,9 @@ async function preview($: EngineInterface, e: Record<string, unknown> & { agentI
   // Fail fast; the publish transition decides again at the end.
   await step($, { type: 'expire', now: await $.clock.now() })
   const busy = (await read($, sessionAtom)).preview
+  if (busy?.state === 'interrupted') {
+    throw new Refusal('INTERRUPTED', `An apply of preview ${busy.id} was interrupted (a reload, a restart or a failure inside the plugin); it is never resumed. Check its files, then /ast-grep discard.`, { files: fileReport(busy.files) })
+  }
   if (busy) throw new Refusal('PREVIEW_PENDING', `Preview ${busy.id} is still pending; apply or discard it first.`)
   const where = await whereNow($)
   await ensureCli($)
@@ -332,6 +497,8 @@ async function apply($: EngineInterface, e: Record<string, unknown> & { agentId?
     throw new Refusal(refused.code, refused.message, refused.code === 'INTERRUPTED' && held ? { files: fileReport(held.files) } : {})
   }
   const p = started.record.preview!
+  // Kept in the store from before the first Write until the apply ends, so a new process can report a lost one.
+  let record: ApplyRecord | null = null
   try {
     // 1. Every target unchanged, before any write.
     const changed: string[] = []
@@ -355,6 +522,11 @@ async function apply($: EngineInterface, e: Record<string, unknown> & { agentId?
     }
     // 3. Write each file through the Write tool, then read it back.
     const files = p.files.map(f => ({ ...f }))
+    record = {
+      previewId: id, root: p.root, at: await $.clock.now(),
+      files: p.files.map(f => ({ path: f.path, beforeHash: f.beforeHash, afterHash: f.afterHash, replacements: f.replacements, status: 'unstarted' as const })),
+    }
+    await storeSet($, applyKey(p.sessionId), record)
     let written = 0
     for (let i = 0; i < files.length; i++) {
       const f = files[i]!
@@ -395,6 +567,9 @@ async function apply($: EngineInterface, e: Record<string, unknown> & { agentId?
       f.status = o.status
       if (o.note) f.note = o.note
       await step($, { type: 'writeResult', id, runId, index: i, status: o.status, ...(o.note ? { note: o.note } : {}) })
+      record.files[i]!.status = o.status
+      record.at = await $.clock.now()
+      await storeSet($, applyKey(p.sessionId), record)
       if (o.status !== 'written') break
       written++
     }
@@ -420,6 +595,7 @@ async function apply($: EngineInterface, e: Record<string, unknown> & { agentId?
     throw new Refusal(code, `${written} of ${files.length} files written; stopped at ${stop.path} (${stop.status}${stop.note ? `: ${stop.note}` : ''}). Files after it were not touched. ${after}${written > 0 ? ' Read the written files before editing them.' : ''}`, { files: report })
   } finally {
     liveRuns.delete(runId)
+    if (record) await settleApply($, p.sessionId, id, runId)
   }
 }
 
@@ -467,6 +643,9 @@ export const register: Register = (on, options) => {
     await registerTools($)
     // A fresh copy of the module has no live apply: one left applying was interrupted.
     await step($, { type: 'reload' })
+    // A new process starts with an empty $.state: bring back what the store kept for this session.
+    await restoreAfterRestart($)
+    await pruneRecords($)
     return next(e)
   })
 
@@ -480,7 +659,9 @@ export const register: Register = (on, options) => {
     const cmd = parseArgs(e.args)
     if (cmd.kind === 'help') return { text: cmd.error ? `${cmd.error}\n${USAGE}` : USAGE }
     if (cmd.kind === 'set') {
-      await step($, cmd.mode === 'off' ? { type: 'off' } : { type: 'on' })
+      const done = await step($, cmd.mode === 'off' ? { type: 'off' } : { type: 'on' })
+      // Kept in the store so a new process for this session starts in the same mode.
+      await keepMode($, done.record.mode)
     }
     if (cmd.kind === 'discard') {
       const done = await step($, { type: 'discard', id: null })

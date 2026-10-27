@@ -77,6 +77,36 @@ export type Session = {
   epoch: number
 }
 
+/**
+ * What `$.store` keeps under `apply/<session id>` while an apply writes (from
+ * before its first Write until it ends), so a new process can say what a lost
+ * apply left behind. No file content: only paths and hashes.
+ */
+export type ApplyRecord = {
+  previewId: string
+  /** The preview's root; each `path` is relative to it. */
+  root: string
+  /** When it was last written (ms); records older than 7 days are pruned. */
+  at: number
+  files: {
+    path: string
+    /** The file's hash at preview time: what apply checks before writing. */
+    beforeHash: string
+    /** The hash of the previewed content: what a written file holds. */
+    afterHash: string
+    replacements: number
+    /** As of the last Write that landed; a new process re-hashes the file rather than trusting it. */
+    status: FileStatus
+  }[]
+}
+
+/** What `$.store` keeps under `mode/<session id>`: the session's /ast-grep on|off override. */
+export type ModeRecord = {
+  mode: Mode
+  /** When it was last written (ms); records older than 30 days are pruned. */
+  at: number
+}
+
 /** One recorded ast-grep run (hooks/corpus.ts, written by scripts/capture-corpus.sh). */
 export type CorpusCase = {
   name: string
