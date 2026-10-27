@@ -41,6 +41,7 @@ function world(on: On, opts: { files?: Record<string, File>; write?: (path: stri
     tools: [] as { name: string; isDeferred?: boolean }[],
     commands: [] as string[],
     runs: [] as string[][],
+    logs: [] as string[],
     writes: [] as { path: string; content: string }[],
     files,
     sessionId: 's1',
@@ -52,7 +53,10 @@ function world(on: On, opts: { files?: Record<string, File>; write?: (path: stri
   on('session.end', ($, e) => ({ sessionId: e.sessionId }))
   on('session.id', () => ({ value: seen.sessionId }))
   on('session.cwd', () => ({ value: seen.cwd }))
-  on('ui.log', () => ({ value: undefined }))
+  on('ui.log', ($, e) => {
+    seen.logs.push(e.text)
+    return { value: undefined }
+  })
   on('command.register', ($, e) => {
     seen.commands.push(e.name)
     return { value: { command: e.name } }
@@ -296,6 +300,18 @@ describe('preview and apply', () => {
     ])
     expect(seen.runs.filter(r => r[1] === 'scan').length).toBe(scans)
     expect(err(await call($, 'apply', { previewId: p.previewId })).code).toBe('UNKNOWN_PREVIEW')
+  })
+
+  test('log lines carry no hand-written plugin-name prefix (the engine adds it)', async ($, on) => {
+    const seen = world(on)
+    await start($)
+    const p = ok(await call($, 'preview', { ...FOO, paths: ['src'] }))
+    ok(await call($, 'apply', { previewId: p.previewId }))
+    expect(seen.logs).toEqual([
+      `preview ${p.previewId}: 3 replacements in 2 files`,
+      expect.stringMatching(/^apply /),
+    ])
+    for (const line of seen.logs) expect(line.startsWith('ast-grep: ')).toBe(false)
   })
 
   test('a same-size change in one target after preview means zero writes to every target', async ($, on) => {

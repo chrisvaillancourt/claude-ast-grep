@@ -58,7 +58,7 @@ class Refusal extends Error {
 /** Best effort: reporting must never throw out of a hook. */
 function log($: EngineInterface, text: string) {
   try {
-    $.ui.log(`${NAME}: ${text}`)
+    $.ui.log(text)
   } catch {
     // nothing to do
   }
