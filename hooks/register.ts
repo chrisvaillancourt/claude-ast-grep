@@ -192,14 +192,23 @@ async function forgetApply($: EngineInterface, sessionId: string, previewId: str
 }
 
 /**
- * The apply has ended: its record goes, unless the session record still holds
- * it applying or interrupted (a reload or a failure inside the plugin cut it
- * short), which keeps it reported until it is discarded.
+ * The apply has ended. `step` already forgot its record when a transition took
+ * the preview out of `applying`; this covers a record the run wrote again after
+ * that (a /clear mid-apply). The record goes unless the session record still
+ * holds the run applying or interrupted (a reload or a failure inside the
+ * plugin cut it short), which keeps it reported until it is discarded. Read
+ * through a versioned update that writes the same value back, since a plain
+ * read can be stale.
  */
 async function settleApply($: EngineInterface, sessionId: string, id: string, runId: string) {
   try {
-    const held = (await read($, sessionAtom)).preview
-    if (held && held.id === id && held.runId === runId && held.state !== 'pending') return
+    let held: Preview | null = null
+    await update($, sessionAtom, s => {
+      held = s.preview
+      return s
+    })
+    const p = held as Preview | null
+    if (p && p.id === id && p.runId === runId && p.state !== 'pending') return
   } catch {
     // fall through: forget it
   }
@@ -332,9 +341,11 @@ async function step($: EngineInterface, ev: LifeEvent): Promise<Step> {
     return out.record
   })
   // An applying or interrupted preview keeps its apply record in the store; once
-  // the session record no longer holds it (discard, off, /clear, the apply's end), neither does the store.
+  // the record this transition returned no longer holds it so (discard, off, /clear,
+  // the apply's end, a refused apply kept pending), neither does the store.
   const gone = before.preview
-  if (gone && gone.state !== 'pending' && out.record.preview?.id !== gone.id) await forgetApply($, gone.sessionId, gone.id)
+  const now = out.record.preview
+  if (gone && gone.state !== 'pending' && !(now && now.id === gone.id && now.state !== 'pending')) await forgetApply($, gone.sessionId, gone.id)
   return out
 }
 

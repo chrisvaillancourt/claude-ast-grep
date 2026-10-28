@@ -798,6 +798,29 @@ describe('a new process: what survives a restart', () => {
     expect(seen.store.has('apply/s1')).toBe(false)
   })
 
+  test('a refused first write keeps the preview and leaves no record, even when the last state read is stale', async ($, on) => {
+    let armed = false
+    const seen = world(on, { write: () => { armed = true; return 'deny' } })
+    let applying: unknown = null
+    // the hook's answer: { value: { value: { shape, value: Session }, version } }
+    const prev = (snap: any) => (snap?.value?.value?.value?.preview ?? null) as { state: string } | null
+    on('state.get', { plugin: 'ast-grep', key: 'session' }, async (_h, e, next) => {
+      const snap = await next(e)
+      if (prev(snap)?.state === 'applying') applying = snap
+      // once the apply ends with the preview back to pending, one read answers from before that
+      if (armed && applying && prev(snap)?.state === 'pending') {
+        armed = false
+        return applying as typeof snap
+      }
+      return snap
+    })
+    await start($)
+    const p = ok(await call($, 'preview', { ...FOO, paths: ['src'] }))
+    const e = err(await call($, 'apply', { previewId: p.previewId }))
+    expect(e.message).toContain('The preview stays pending')
+    expect(seen.store.has('apply/s1')).toBe(false)
+  })
+
   test('a refused, stale or partly refused apply leaves no record', async ($, on) => {
     let refuse = 'a.ts'
     const seen = world(on, { write: p => (p.endsWith(refuse) ? 'deny' : 'ok') })
